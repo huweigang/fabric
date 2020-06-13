@@ -1,232 +1,158 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package flogging_test
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"os"
 	"testing"
 
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/op/go-logging"
-	"github.com/spf13/viper"
+	"github.com/hyperledger/fabric/common/flogging/mock"
+	"github.com/stretchr/testify/assert"
+	"go.uber.org/zap/zapcore"
 )
 
-func TestLevelDefault(t *testing.T) {
-	viper.Reset()
+func TestNew(t *testing.T) {
+	logging, err := flogging.New(flogging.Config{})
+	assert.NoError(t, err)
+	assert.Equal(t, zapcore.InfoLevel, logging.DefaultLevel())
 
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
+	_, err = flogging.New(flogging.Config{
+		LogSpec: "::=borken=::",
+	})
+	assert.EqualError(t, err, "invalid logging specification '::=borken=::': bad segment '=borken='")
 }
 
-func TestLevelOtherThanDefault(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "warning")
+func TestNewWithEnvironment(t *testing.T) {
+	oldSpec, set := os.LookupEnv("FABRIC_LOGGING_SPEC")
+	if set {
+		defer os.Setenv("FABRIC_LOGGING_SPEC", oldSpec)
+	}
 
-	flogging.InitFromViper("")
+	os.Setenv("FABRIC_LOGGING_SPEC", "fatal")
+	logging, err := flogging.New(flogging.Config{})
+	assert.NoError(t, err)
+	assert.Equal(t, zapcore.FatalLevel, logging.DefaultLevel())
 
-	assertDefaultLevel(t, logging.WARNING)
+	os.Unsetenv("FABRIC_LOGGING_SPEC")
+	logging, err = flogging.New(flogging.Config{})
+	assert.NoError(t, err)
+	assert.Equal(t, zapcore.InfoLevel, logging.DefaultLevel())
 }
 
-func TestLevelForSpecificModule(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "core=info")
-
-	flogging.InitFromViper("")
-
-	assertModuleLevel(t, "core", logging.INFO)
+//go:generate counterfeiter -o mock/write_syncer.go -fake-name WriteSyncer . writeSyncer
+type writeSyncer interface {
+	zapcore.WriteSyncer
 }
 
-func TestLeveltForMultipleModules(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "core=warning:test=debug")
+func TestLoggingSetWriter(t *testing.T) {
+	ws := &mock.WriteSyncer{}
 
-	flogging.InitFromViper("")
+	w := &bytes.Buffer{}
+	logging, err := flogging.New(flogging.Config{
+		Writer: w,
+	})
+	assert.NoError(t, err)
 
-	assertModuleLevel(t, "core", logging.WARNING)
-	assertModuleLevel(t, "test", logging.DEBUG)
+	old := logging.SetWriter(ws)
+	logging.SetWriter(w)
+	original := logging.SetWriter(ws)
+
+	assert.Exactly(t, old, original)
+	_, err = logging.Write([]byte("hello"))
+	assert.NoError(t, err)
+	assert.Equal(t, 1, ws.WriteCallCount())
+	assert.Equal(t, []byte("hello"), ws.WriteArgsForCall(0))
+
+	err = logging.Sync()
+	assert.NoError(t, err)
+
+	ws.SyncReturns(errors.New("welp"))
+	err = logging.Sync()
+	assert.EqualError(t, err, "welp")
 }
 
-func TestLevelForMultipleModulesAtSameLevel(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "core,test=warning")
+func TestNamedLogger(t *testing.T) {
+	defer flogging.Reset()
+	buf := &bytes.Buffer{}
+	flogging.Global.SetWriter(buf)
 
-	flogging.InitFromViper("")
+	t.Run("logger and named (child) logger with different levels", func(t *testing.T) {
+		defer buf.Reset()
+		logger := flogging.MustGetLogger("eugene")
+		logger2 := logger.Named("george")
+		flogging.ActivateSpec("eugene=info:eugene.george=error")
 
-	assertModuleLevel(t, "core", logging.WARNING)
-	assertModuleLevel(t, "test", logging.WARNING)
+		logger.Info("from eugene")
+		logger2.Info("from george")
+		assert.Contains(t, buf.String(), "from eugene")
+		assert.NotContains(t, buf.String(), "from george")
+	})
+
+	t.Run("named logger where parent logger isn't enabled", func(t *testing.T) {
+		logger := flogging.MustGetLogger("foo")
+		logger2 := logger.Named("bar")
+		flogging.ActivateSpec("foo=fatal:foo.bar=error")
+		logger.Error("from foo")
+		logger2.Error("from bar")
+		assert.NotContains(t, buf.String(), "from foo")
+		assert.Contains(t, buf.String(), "from bar")
+	})
 }
 
-func TestLevelForModuleWithDefault(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "info:test=warning")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, logging.INFO)
-	assertModuleLevel(t, "test", logging.WARNING)
-}
-
-func TestLevelForModuleWithDefaultAtEnd(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "test=warning:info")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, logging.INFO)
-	assertModuleLevel(t, "test", logging.WARNING)
-}
-
-func TestLevelForSpecificCommand(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging.node", "error")
-
-	flogging.InitFromViper("node")
-
-	assertDefaultLevel(t, logging.ERROR)
-}
-
-func TestLevelForUnknownCommandGoesToDefault(t *testing.T) {
-	viper.Reset()
-
-	flogging.InitFromViper("unknown command")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
-}
-
-func TestLevelInvalid(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "invalidlevel")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
-}
-
-func TestLevelInvalidModules(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "core=invalid")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
-}
-
-func TestLevelInvalidEmptyModule(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "=warning")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
-}
-
-func TestLevelInvalidModuleSyntax(t *testing.T) {
-	viper.Reset()
-	viper.Set("logging_level", "type=warn=again")
-
-	flogging.InitFromViper("")
-
-	assertDefaultLevel(t, flogging.DefaultLevel())
-}
-
-func TestGetModuleLevelDefault(t *testing.T) {
-	level, _ := flogging.GetModuleLevel("peer")
-
-	// peer should be using the default log level at this point
-	if level != "INFO" {
-		t.FailNow()
+func TestInvalidLoggerName(t *testing.T) {
+	names := []string{"test*", ".test", "test.", ".", ""}
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			msg := fmt.Sprintf("invalid logger name: %s", name)
+			assert.PanicsWithValue(t, msg, func() { flogging.MustGetLogger(name) })
+		})
 	}
 }
 
-func TestGetModuleLevelDebug(t *testing.T) {
-	flogging.SetModuleLevel("peer", "DEBUG")
-	level, _ := flogging.GetModuleLevel("peer")
+func TestCheck(t *testing.T) {
+	l := &flogging.Logging{}
+	observer := &mock.Observer{}
+	e := zapcore.Entry{}
 
-	// ensure that the log level has changed to debug
-	if level != "DEBUG" {
-		t.FailNow()
-	}
+	// set observer
+	l.SetObserver(observer)
+	l.Check(e, nil)
+	assert.Equal(t, 1, observer.CheckCallCount())
+	e, ce := observer.CheckArgsForCall(0)
+	assert.Equal(t, e, zapcore.Entry{})
+	assert.Nil(t, ce)
+
+	l.WriteEntry(e, nil)
+	assert.Equal(t, 1, observer.WriteEntryCallCount())
+	e, f := observer.WriteEntryArgsForCall(0)
+	assert.Equal(t, e, zapcore.Entry{})
+	assert.Nil(t, f)
+
+	//	remove observer
+	l.SetObserver(nil)
+	l.Check(zapcore.Entry{}, nil)
+	assert.Equal(t, 1, observer.CheckCallCount())
 }
 
-func TestGetModuleLevelInvalid(t *testing.T) {
-	flogging.SetModuleLevel("peer", "invalid")
-	level, _ := flogging.GetModuleLevel("peer")
+func TestLoggerCoreCheck(t *testing.T) {
+	logging, err := flogging.New(flogging.Config{})
+	assert.NoError(t, err)
 
-	// ensure that the log level didn't change after invalid log level specified
-	if level != "DEBUG" {
-		t.FailNow()
-	}
-}
+	logger := logging.ZapLogger("foo")
 
-func TestSetModuleLevel(t *testing.T) {
-	flogging.SetModuleLevel("peer", "WARNING")
+	err = logging.ActivateSpec("info")
+	assert.NoError(t, err)
+	assert.False(t, logger.Core().Enabled(zapcore.DebugLevel), "debug should not be enabled at info level")
 
-	// ensure that the log level has changed to warning
-	assertModuleLevel(t, "peer", logging.WARNING)
-}
-
-func TestSetModuleLevelInvalid(t *testing.T) {
-	flogging.SetModuleLevel("peer", "invalid")
-
-	// ensure that the log level didn't change after invalid log level specified
-	assertModuleLevel(t, "peer", logging.WARNING)
-}
-
-func ExampleSetLoggingFormat() {
-	// initializes logging backend for testing and sets
-	// time to 1970-01-01 00:00:00.000 UTC
-	logging.InitForTesting(flogging.DefaultLevel())
-
-	logFormat := "%{time:2006-01-02 15:04:05.000 MST} [%{module}] %{shortfunc} -> %{level:.4s} %{id:03x} %{message}"
-	flogging.SetLoggingFormat(logFormat, os.Stdout)
-
-	logger := logging.MustGetLogger("floggingTest")
-	logger.Infof("test")
-
-	// Output:
-	// 1970-01-01 00:00:00.000 UTC [floggingTest] ExampleSetLoggingFormat -> INFO 001 test
-}
-
-func ExampleSetLoggingFormat_second() {
-	// initializes logging backend for testing and sets
-	// time to 1970-01-01 00:00:00.000 UTC
-	logging.InitForTesting(flogging.DefaultLevel())
-
-	logFormat := "%{time:15:04:05.000} [%{module}] %{shortfunc} -> %{level:.4s} %{id:03x} %{message}"
-	flogging.SetLoggingFormat(logFormat, os.Stdout)
-
-	logger := logging.MustGetLogger("floggingTest")
-	logger.Infof("test")
-
-	// Output:
-	// 00:00:00.000 [floggingTest] ExampleSetLoggingFormat_second -> INFO 001 test
-}
-
-func assertDefaultLevel(t *testing.T, expectedLevel logging.Level) {
-	assertModuleLevel(t, "", expectedLevel)
-}
-
-func assertModuleLevel(t *testing.T, module string, expectedLevel logging.Level) {
-	assertEquals(t, expectedLevel, logging.GetLevel(module))
-}
-
-func assertEquals(t *testing.T, expected interface{}, actual interface{}) {
-	if expected != actual {
-		t.Errorf("Expected: %v, Got: %v", expected, actual)
-	}
+	err = logging.ActivateSpec("debug")
+	assert.NoError(t, err)
+	assert.True(t, logger.Core().Enabled(zapcore.DebugLevel), "debug should now be enabled at debug level")
 }

@@ -1,27 +1,17 @@
+// +build pkcs11
+
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
+
 package pkcs11
 
 import (
 	"bytes"
-	"crypto"
-	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/sha512"
 	"crypto/x509"
@@ -29,9 +19,11 @@ import (
 	"encoding/asn1"
 	"fmt"
 	"hash"
+	"io/ioutil"
 	"math/big"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -39,72 +31,153 @@ import (
 	"github.com/hyperledger/fabric/bccsp/signer"
 	"github.com/hyperledger/fabric/bccsp/sw"
 	"github.com/hyperledger/fabric/bccsp/utils"
+	"github.com/stretchr/testify/assert"
 	"golang.org/x/crypto/sha3"
 )
 
 var (
 	currentKS         bccsp.KeyStore
 	currentBCCSP      bccsp.BCCSP
-	currentSWBCCSP    bccsp.BCCSP
 	currentTestConfig testConfig
 )
 
 type testConfig struct {
 	securityLevel int
 	hashFamily    string
+	softVerify    bool
+	immutable     bool
 }
 
 func TestMain(m *testing.M) {
-	ks := &FileBasedKeyStore{}
-	if err := ks.Init(nil, os.TempDir(), false); err != nil {
-		fmt.Printf("Failed initiliazing KeyStore [%s]", err)
-		os.Exit(-1)
-	}
-	currentKS = ks
+	os.Exit(testMain(m))
+}
 
-	lib, pin, label := findPKCS11Lib()
-	if enablePKCS11tests {
-		err := InitPKCS11(lib, pin, label)
-		if err != nil {
-			fmt.Printf("Failed initializing PKCS11 library [%s]", err)
-			os.Exit(-1)
-		}
-	} else {
-		fmt.Printf("No PKCS11 library found, skipping PKCS11 tests")
+func testMain(m *testing.M) int {
+	tmpDir, err := ioutil.TempDir("", "pkcs11_ks")
+	if err != nil {
+		fmt.Printf("Failed to create keystore directory [%s]\n", err)
+		return -1
 	}
+	defer os.RemoveAll(tmpDir)
 
+	keyStore, err := sw.NewFileBasedKeyStore(nil, tmpDir, false)
+	if err != nil {
+		fmt.Printf("Failed initiliazing KeyStore [%s]\n", err)
+		return -1
+	}
+	currentKS = keyStore
+
+	lib, pin, label := FindPKCS11Lib()
 	tests := []testConfig{
-		{256, "SHA2"},
-		{256, "SHA3"},
-		{384, "SHA2"},
-		{384, "SHA3"},
+		{256, "SHA2", true, false},
+		{256, "SHA3", false, false},
+		{384, "SHA2", false, false},
+		{384, "SHA3", false, false},
+		{384, "SHA3", true, false},
+	}
+
+	if strings.Contains(lib, "softhsm") {
+		tests = append(tests, []testConfig{
+			{256, "SHA2", true, false},
+			{256, "SHA2", true, true},
+		}...)
+	}
+
+	opts := PKCS11Opts{
+		Library: lib,
+		Label:   label,
+		Pin:     pin,
 	}
 
 	for _, config := range tests {
-		var err error
 		currentTestConfig = config
-		currentBCCSP, err = New(config.securityLevel, config.hashFamily, currentKS)
+
+		opts.HashFamily = config.hashFamily
+		opts.SecLevel = config.securityLevel
+		opts.SoftVerify = config.softVerify
+		opts.Immutable = config.immutable
+		fmt.Printf("Immutable = [%v]\n", opts.Immutable)
+		currentBCCSP, err = New(opts, keyStore)
 		if err != nil {
-			fmt.Printf("Failed initiliazing BCCSP at [%d, %s]: [%s]", config.securityLevel, config.hashFamily, err)
-			os.Exit(-1)
+			fmt.Printf("Failed initiliazing BCCSP at [%+v] \n%s\n", opts, err)
+			return -1
 		}
 
-		currentSWBCCSP, err = sw.New(config.securityLevel, config.hashFamily, sw.NewDummyKeyStore())
-		if err != nil {
-			fmt.Printf("Failed initiliazing BCCSP at [%d, %s]: [%s]", config.securityLevel, config.hashFamily, err)
-			os.Exit(-1)
-		}
 		ret := m.Run()
 		if ret != 0 {
-			fmt.Printf("Failed testing at [%d, %s]", config.securityLevel, config.hashFamily)
-			os.Exit(-1)
+			fmt.Printf("Failed testing at [%+v]\n", opts)
+			return -1
 		}
 	}
-	os.Exit(0)
+	return 0
+}
+
+func TestNew(t *testing.T) {
+	opts := PKCS11Opts{
+		HashFamily: "SHA2",
+		SecLevel:   256,
+		SoftVerify: false,
+		Library:    "lib",
+		Label:      "ForFabric",
+		Pin:        "98765432",
+	}
+
+	// Setup PKCS11 library and provide initial set of values
+	lib, _, _ := FindPKCS11Lib()
+	opts.Library = lib
+
+	// Test for nil keystore
+	_, err := New(opts, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid bccsp.KeyStore instance. It must be different from nil")
+
+	// Test for invalid PKCS11 loadLib
+	opts.Library = ""
+	_, err = New(opts, currentKS)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Failed initializing PKCS11 library")
+}
+
+func TestFindPKCS11LibEnvVars(t *testing.T) {
+	const (
+		dummy_PKCS11_LIB   = "/usr/lib/pkcs11"
+		dummy_PKCS11_PIN   = "98765432"
+		dummy_PKCS11_LABEL = "testing"
+	)
+
+	// Set environment variables used for test and preserve
+	// original values for restoration after test completion
+	orig_PKCS11_LIB := os.Getenv("PKCS11_LIB")
+	os.Setenv("PKCS11_LIB", dummy_PKCS11_LIB)
+
+	orig_PKCS11_PIN := os.Getenv("PKCS11_PIN")
+	os.Setenv("PKCS11_PIN", dummy_PKCS11_PIN)
+
+	orig_PKCS11_LABEL := os.Getenv("PKCS11_LABEL")
+	os.Setenv("PKCS11_LABEL", dummy_PKCS11_LABEL)
+
+	lib, pin, label := FindPKCS11Lib()
+	assert.EqualValues(t, dummy_PKCS11_LIB, lib, "FindPKCS11Lib did not return expected library")
+	assert.EqualValues(t, dummy_PKCS11_PIN, pin, "FindPKCS11Lib did not return expected pin")
+	assert.EqualValues(t, dummy_PKCS11_LABEL, label, "FindPKCS11Lib did not return expected label")
+
+	os.Setenv("PKCS11_LIB", orig_PKCS11_LIB)
+	os.Setenv("PKCS11_PIN", orig_PKCS11_PIN)
+	os.Setenv("PKCS11_LABEL", orig_PKCS11_LABEL)
 }
 
 func TestInvalidNewParameter(t *testing.T) {
-	r, err := New(0, "SHA2", currentKS)
+	lib, pin, label := FindPKCS11Lib()
+	opts := PKCS11Opts{
+		Library:    lib,
+		Label:      label,
+		Pin:        pin,
+		SoftVerify: true,
+	}
+
+	opts.HashFamily = "SHA2"
+	opts.SecLevel = 0
+	r, err := New(opts, currentKS)
 	if err == nil {
 		t.Fatal("Error should be different from nil in this case")
 	}
@@ -112,7 +185,9 @@ func TestInvalidNewParameter(t *testing.T) {
 		t.Fatal("Return value should be equal to nil in this case")
 	}
 
-	r, err = New(256, "SHA8", currentKS)
+	opts.HashFamily = "SHA8"
+	opts.SecLevel = 256
+	r, err = New(opts, currentKS)
 	if err == nil {
 		t.Fatal("Error should be different from nil in this case")
 	}
@@ -120,7 +195,9 @@ func TestInvalidNewParameter(t *testing.T) {
 		t.Fatal("Return value should be equal to nil in this case")
 	}
 
-	r, err = New(256, "SHA2", nil)
+	opts.HashFamily = "SHA2"
+	opts.SecLevel = 256
+	r, err = New(opts, nil)
 	if err == nil {
 		t.Fatal("Error should be different from nil in this case")
 	}
@@ -128,15 +205,9 @@ func TestInvalidNewParameter(t *testing.T) {
 		t.Fatal("Return value should be equal to nil in this case")
 	}
 
-	r, err = New(0, "SHA3", nil)
-	if err == nil {
-		t.Fatal("Error should be different from nil in this case")
-	}
-	if r != nil {
-		t.Fatal("Return value should be equal to nil in this case")
-	}
-
-	r, err = NewDefaultSecurityLevel("")
+	opts.HashFamily = "SHA3"
+	opts.SecLevel = 0
+	r, err = New(opts, nil)
 	if err == nil {
 		t.Fatal("Error should be different from nil in this case")
 	}
@@ -205,115 +276,6 @@ func TestKeyGenECDSAOpts(t *testing.T) {
 	}
 }
 
-func TestKeyGenRSAOpts(t *testing.T) {
-	// 1024
-	k, err := currentBCCSP.KeyGen(&bccsp.RSA1024KeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA 1024 key [%s]", err)
-	}
-	if k == nil {
-		t.Fatal("Failed generating RSA 1024 key. Key must be different from nil")
-	}
-	if !k.Private() {
-		t.Fatal("Failed generating RSA 1024 key. Key should be private")
-	}
-	if k.Symmetric() {
-		t.Fatal("Failed generating RSA 1024 key. Key should be asymmetric")
-	}
-
-	rsaKey := k.(*rsaPrivateKey).privKey
-	if rsaKey.N.BitLen() != 1024 {
-		t.Fatal("1024 RSA generated key in invalid. Modulus be of length 1024.")
-	}
-	if rsaKey.D.Cmp(big.NewInt(0)) == 0 {
-		t.Fatal("1024 RSA generated key in invalid. Private key must be different from 0.")
-	}
-	if rsaKey.E < 3 {
-		t.Fatal("1024 RSA generated key in invalid. Private key must be different from 0.")
-	}
-
-	// 2048
-	k, err = currentBCCSP.KeyGen(&bccsp.RSA2048KeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA 2048 key [%s]", err)
-	}
-	if k == nil {
-		t.Fatal("Failed generating RSA 2048 key. Key must be different from nil")
-	}
-	if !k.Private() {
-		t.Fatal("Failed generating RSA 2048 key. Key should be private")
-	}
-	if k.Symmetric() {
-		t.Fatal("Failed generating RSA 2048 key. Key should be asymmetric")
-	}
-
-	rsaKey = k.(*rsaPrivateKey).privKey
-	if rsaKey.N.BitLen() != 2048 {
-		t.Fatal("2048 RSA generated key in invalid. Modulus be of length 2048.")
-	}
-	if rsaKey.D.Cmp(big.NewInt(0)) == 0 {
-		t.Fatal("2048 RSA generated key in invalid. Private key must be different from 0.")
-	}
-	if rsaKey.E < 3 {
-		t.Fatal("2048 RSA generated key in invalid. Private key must be different from 0.")
-	}
-
-	/*
-		// Skipping these tests because they take too much time to run.
-		// 3072
-		k, err = currentBCCSP.KeyGen(&bccsp.RSA3072KeyGenOpts{Temporary: false})
-		if err != nil {
-			t.Fatalf("Failed generating RSA 3072 key [%s]", err)
-		}
-		if k == nil {
-			t.Fatal("Failed generating RSA 3072 key. Key must be different from nil")
-		}
-		if !k.Private() {
-			t.Fatal("Failed generating RSA 3072 key. Key should be private")
-		}
-		if k.Symmetric() {
-			t.Fatal("Failed generating RSA 3072 key. Key should be asymmetric")
-		}
-
-		rsaKey = k.(*rsaPrivateKey).privKey
-		if rsaKey.N.BitLen() != 3072 {
-			t.Fatal("3072 RSA generated key in invalid. Modulus be of length 3072.")
-		}
-		if rsaKey.D.Cmp(big.NewInt(0)) == 0 {
-			t.Fatal("3072 RSA generated key in invalid. Private key must be different from 0.")
-		}
-		if rsaKey.E < 3 {
-			t.Fatal("3072 RSA generated key in invalid. Private key must be different from 0.")
-		}
-
-		// 4096
-		k, err = currentBCCSP.KeyGen(&bccsp.RSA4096KeyGenOpts{Temporary: false})
-		if err != nil {
-			t.Fatalf("Failed generating RSA 4096 key [%s]", err)
-		}
-		if k == nil {
-			t.Fatal("Failed generating RSA 4096 key. Key must be different from nil")
-		}
-		if !k.Private() {
-			t.Fatal("Failed generating RSA 4096 key. Key should be private")
-		}
-		if k.Symmetric() {
-			t.Fatal("Failed generating RSA 4096 key. Key should be asymmetric")
-		}
-
-		rsaKey = k.(*rsaPrivateKey).privKey
-		if rsaKey.N.BitLen() != 4096 {
-			t.Fatal("4096 RSA generated key in invalid. Modulus be of length 4096.")
-		}
-		if rsaKey.D.Cmp(big.NewInt(0)) == 0 {
-			t.Fatal("4096 RSA generated key in invalid. Private key must be different from 0.")
-		}
-		if rsaKey.E < 3 {
-			t.Fatal("4096 RSA generated key in invalid. Private key must be different from 0.")
-		}
-	*/
-}
-
 func TestKeyGenAESOpts(t *testing.T) {
 	// AES 128
 	k, err := currentBCCSP.KeyGen(&bccsp.AES128KeyGenOpts{Temporary: false})
@@ -328,11 +290,6 @@ func TestKeyGenAESOpts(t *testing.T) {
 	}
 	if !k.Symmetric() {
 		t.Fatal("Failed generating AES 128 key. Key should be symmetric")
-	}
-
-	aesKey := k.(*aesPrivateKey).privKey
-	if len(aesKey) != 16 {
-		t.Fatal("AES Key generated key in invalid. The key must have length 16.")
 	}
 
 	// AES 192
@@ -350,11 +307,6 @@ func TestKeyGenAESOpts(t *testing.T) {
 		t.Fatal("Failed generating AES 192 key. Key should be symmetric")
 	}
 
-	aesKey = k.(*aesPrivateKey).privKey
-	if len(aesKey) != 24 {
-		t.Fatal("AES Key generated key in invalid. The key must have length 16.")
-	}
-
 	// AES 256
 	k, err = currentBCCSP.KeyGen(&bccsp.AES256KeyGenOpts{Temporary: false})
 	if err != nil {
@@ -368,11 +320,6 @@ func TestKeyGenAESOpts(t *testing.T) {
 	}
 	if !k.Symmetric() {
 		t.Fatal("Failed generating AES 256 key. Key should be symmetric")
-	}
-
-	aesKey = k.(*aesPrivateKey).privKey
-	if len(aesKey) != 32 {
-		t.Fatal("AES Key generated key in invalid. The key must have length 16.")
 	}
 }
 
@@ -467,7 +414,6 @@ func TestECDSAKeyGenEphemeral(t *testing.T) {
 }
 
 func TestECDSAPrivateKeySKI(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -480,7 +426,6 @@ func TestECDSAPrivateKeySKI(t *testing.T) {
 }
 
 func TestECDSAKeyGenNonEphemeral(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -497,7 +442,6 @@ func TestECDSAKeyGenNonEphemeral(t *testing.T) {
 }
 
 func TestECDSAGetKeyBySKI(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -524,7 +468,6 @@ func TestECDSAGetKeyBySKI(t *testing.T) {
 }
 
 func TestECDSAPublicKeyFromPrivateKey(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -546,7 +489,6 @@ func TestECDSAPublicKeyFromPrivateKey(t *testing.T) {
 }
 
 func TestECDSAPublicKeyBytes(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -567,7 +509,6 @@ func TestECDSAPublicKeyBytes(t *testing.T) {
 }
 
 func TestECDSAPublicKeySKI(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -584,54 +525,7 @@ func TestECDSAPublicKeySKI(t *testing.T) {
 	}
 }
 
-func TestECDSAKeyReRand(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating ECDSA key [%s]", err)
-	}
-	if k == nil {
-		t.Fatal("Failed re-randomizing ECDSA key. Re-randomized Key must be different from nil")
-	}
-
-	reRandomizedKey, err := currentBCCSP.KeyDeriv(k, &bccsp.ECDSAReRandKeyOpts{Temporary: false, Expansion: []byte{1}})
-	if err != nil {
-		t.Fatalf("Failed re-randomizing ECDSA key [%s]", err)
-	}
-	if !reRandomizedKey.Private() {
-		t.Fatal("Failed re-randomizing ECDSA key. Re-randomized Key should be private")
-	}
-	if reRandomizedKey.Symmetric() {
-		t.Fatal("Failed re-randomizing ECDSA key. Re-randomized Key should be asymmetric")
-	}
-
-	k2, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting public ECDSA key from private [%s]", err)
-	}
-	if k2 == nil {
-		t.Fatal("Failed re-randomizing ECDSA key. Re-randomized Key must be different from nil")
-	}
-
-	reRandomizedKey2, err := currentBCCSP.KeyDeriv(k2, &bccsp.ECDSAReRandKeyOpts{Temporary: false, Expansion: []byte{1}})
-	if err != nil {
-		t.Fatalf("Failed re-randomizing ECDSA key [%s]", err)
-	}
-
-	if reRandomizedKey2.Private() {
-		t.Fatal("Re-randomized public Key must remain public")
-	}
-	if reRandomizedKey2.Symmetric() {
-		t.Fatal("Re-randomized ECDSA asymmetric key must remain asymmetric")
-	}
-
-	if false == bytes.Equal(reRandomizedKey.SKI(), reRandomizedKey2.SKI()) {
-		t.Fatal("Re-randomized ECDSA Private- or Public-Keys must end up having the same SKI")
-	}
-}
-
 func TestECDSASign(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -651,10 +545,17 @@ func TestECDSASign(t *testing.T) {
 	if len(signature) == 0 {
 		t.Fatal("Failed generating ECDSA key. Signature must be different from nil")
 	}
+
+	_, err = currentBCCSP.Sign(nil, digest, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid Key. It must not be nil")
+
+	_, err = currentBCCSP.Sign(k, nil, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid digest. Cannot be empty")
 }
 
 func TestECDSAVerify(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating ECDSA key [%s]", err)
@@ -693,6 +594,18 @@ func TestECDSAVerify(t *testing.T) {
 		t.Fatal("Failed verifying ECDSA signature. Signature not valid.")
 	}
 
+	_, err = currentBCCSP.Verify(nil, signature, digest, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid Key. It must not be nil")
+
+	_, err = currentBCCSP.Verify(pk, nil, digest, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid signature. Cannot be empty")
+
+	_, err = currentBCCSP.Verify(pk, signature, nil, nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "Invalid digest. Cannot be empty")
+
 	// Import the exported public key
 	pkRaw, err := pk.Bytes()
 	if err != nil {
@@ -719,41 +632,7 @@ func TestECDSAVerify(t *testing.T) {
 	}
 }
 
-func TestECDSAKeyDeriv(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating ECDSA key [%s]", err)
-	}
-
-	reRandomizedKey, err := currentBCCSP.KeyDeriv(k, &bccsp.ECDSAReRandKeyOpts{Temporary: false, Expansion: []byte{1}})
-	if err != nil {
-		t.Fatalf("Failed re-randomizing ECDSA key [%s]", err)
-	}
-
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(reRandomizedKey, digest, nil)
-	if err != nil {
-		t.Fatalf("Failed generating ECDSA signature [%s]", err)
-	}
-
-	valid, err := currentBCCSP.Verify(reRandomizedKey, signature, digest, nil)
-	if err != nil {
-		t.Fatalf("Failed verifying ECDSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying ECDSA signature. Signature not valid.")
-	}
-}
-
 func TestECDSAKeyImportFromExportedKey(t *testing.T) {
-
 	// Generate an ECDSA key
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
@@ -803,7 +682,6 @@ func TestECDSAKeyImportFromExportedKey(t *testing.T) {
 }
 
 func TestECDSAKeyImportFromECDSAPublicKey(t *testing.T) {
-
 	// Generate an ECDSA key
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
@@ -821,7 +699,7 @@ func TestECDSAKeyImportFromECDSAPublicKey(t *testing.T) {
 		t.Fatalf("Failed getting ECDSA raw public key [%s]", err)
 	}
 
-	pub, err := utils.DERToPublicKey(pkRaw)
+	pub, err := x509.ParsePKIXPublicKey(pkRaw)
 	if err != nil {
 		t.Fatalf("Failed converting raw to ecdsa.PublicKey [%s]", err)
 	}
@@ -857,67 +735,7 @@ func TestECDSAKeyImportFromECDSAPublicKey(t *testing.T) {
 	}
 }
 
-func TestECDSAKeyImportFromECDSAPrivateKey(t *testing.T) {
-
-	// Generate an ECDSA key, default is P256
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("Failed generating ECDSA key [%s]", err)
-	}
-
-	// Import the ecdsa.PrivateKey
-	priv, err := utils.PrivateKeyToDER(key)
-	if err != nil {
-		t.Fatalf("Failed converting raw to ecdsa.PrivateKey [%s]", err)
-	}
-
-	sk, err := currentBCCSP.KeyImport(priv, &bccsp.ECDSAPrivateKeyImportOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed importing ECDSA private key [%s]", err)
-	}
-	if sk == nil {
-		t.Fatal("Failed importing ECDSA private key. Return BCCSP key cannot be nil.")
-	}
-
-	// Import the ecdsa.PublicKey
-	pub, err := utils.PublicKeyToDER(&key.PublicKey)
-	if err != nil {
-		t.Fatalf("Failed converting raw to ecdsa.PublicKey [%s]", err)
-	}
-
-	pk, err := currentBCCSP.KeyImport(pub, &bccsp.ECDSAPKIXPublicKeyImportOpts{Temporary: false})
-
-	if err != nil {
-		t.Fatalf("Failed importing ECDSA public key [%s]", err)
-	}
-	if pk == nil {
-		t.Fatal("Failed importing ECDSA public key. Return BCCSP key cannot be nil.")
-	}
-
-	// Sign and verify with the imported public key
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(sk, digest, nil)
-	if err != nil {
-		t.Fatalf("Failed generating ECDSA signature [%s]", err)
-	}
-
-	valid, err := currentBCCSP.Verify(pk, signature, digest, nil)
-	if err != nil {
-		t.Fatalf("Failed verifying ECDSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying ECDSA signature. Signature not valid.")
-	}
-}
-
 func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
-
 	// Generate an ECDSA key
 	k, err := currentBCCSP.KeyGen(&bccsp.ECDSAKeyGenOpts{Temporary: false})
 	if err != nil {
@@ -959,7 +777,7 @@ func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
 		UnknownExtKeyUsage: testUnknownExtKeyUsage,
 
 		BasicConstraintsValid: true,
-		IsCA: true,
+		IsCA:                  true,
 
 		OCSPServer:            []string{"http://ocurrentBCCSP.example.com"},
 		IssuingCertificateURL: []string{"http://crt.example.com/ca1.crt"},
@@ -981,8 +799,7 @@ func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
 		},
 	}
 
-	cryptoSigner := &signer.CryptoSigner{}
-	err = cryptoSigner.Init(currentBCCSP, k)
+	cryptoSigner, err := signer.New(currentBCCSP, k)
 	if err != nil {
 		t.Fatalf("Failed initializing CyrptoSigner [%s]", err)
 	}
@@ -998,7 +815,7 @@ func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
 		t.Fatalf("Failed getting ECDSA raw public key [%s]", err)
 	}
 
-	pub, err := utils.DERToPublicKey(pkRaw)
+	pub, err := x509.ParsePKIXPublicKey(pkRaw)
 	if err != nil {
 		t.Fatalf("Failed converting raw to ECDSA.PublicKey [%s]", err)
 	}
@@ -1008,7 +825,7 @@ func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
 		t.Fatalf("Failed generating self-signed certificate [%s]", err)
 	}
 
-	cert, err := utils.DERToX509Certificate(certRaw)
+	cert, err := x509.ParseCertificate(certRaw)
 	if err != nil {
 		t.Fatalf("Failed generating X509 certificate object from raw [%s]", err)
 	}
@@ -1047,35 +864,35 @@ func TestKeyImportFromX509ECDSAPublicKey(t *testing.T) {
 
 func TestECDSASignatureEncoding(t *testing.T) {
 	v := []byte{0x30, 0x07, 0x02, 0x01, 0x8F, 0x02, 0x02, 0xff, 0xf1}
-	_, err := asn1.Unmarshal(v, &ecdsaSignature{})
+	_, err := asn1.Unmarshal(v, &utils.ECDSASignature{})
 	if err == nil {
 		t.Fatalf("Unmarshalling should fail for [% x]", v)
 	}
 	t.Logf("Unmarshalling correctly failed for [% x] [%s]", v, err)
 
 	v = []byte{0x30, 0x07, 0x02, 0x01, 0x8F, 0x02, 0x02, 0x00, 0x01}
-	_, err = asn1.Unmarshal(v, &ecdsaSignature{})
+	_, err = asn1.Unmarshal(v, &utils.ECDSASignature{})
 	if err == nil {
 		t.Fatalf("Unmarshalling should fail for [% x]", v)
 	}
 	t.Logf("Unmarshalling correctly failed for [% x] [%s]", v, err)
 
 	v = []byte{0x30, 0x07, 0x02, 0x01, 0x8F, 0x02, 0x81, 0x01, 0x01}
-	_, err = asn1.Unmarshal(v, &ecdsaSignature{})
+	_, err = asn1.Unmarshal(v, &utils.ECDSASignature{})
 	if err == nil {
 		t.Fatalf("Unmarshalling should fail for [% x]", v)
 	}
 	t.Logf("Unmarshalling correctly failed for [% x] [%s]", v, err)
 
 	v = []byte{0x30, 0x07, 0x02, 0x01, 0x8F, 0x02, 0x81, 0x01, 0x8F}
-	_, err = asn1.Unmarshal(v, &ecdsaSignature{})
+	_, err = asn1.Unmarshal(v, &utils.ECDSASignature{})
 	if err == nil {
 		t.Fatalf("Unmarshalling should fail for [% x]", v)
 	}
 	t.Logf("Unmarshalling correctly failed for [% x] [%s]", v, err)
 
 	v = []byte{0x30, 0x0A, 0x02, 0x01, 0x8F, 0x02, 0x05, 0x00, 0x00, 0x00, 0x00, 0x8F}
-	_, err = asn1.Unmarshal(v, &ecdsaSignature{})
+	_, err = asn1.Unmarshal(v, &utils.ECDSASignature{})
 	if err == nil {
 		t.Fatalf("Unmarshalling should fail for [% x]", v)
 	}
@@ -1102,12 +919,12 @@ func TestECDSALowS(t *testing.T) {
 		t.Fatalf("Failed generating ECDSA signature [%s]", err)
 	}
 
-	R, S, err := unmarshalECDSASignature(signature)
+	R, S, err := utils.UnmarshalECDSASignature(signature)
 	if err != nil {
 		t.Fatalf("Failed unmarshalling signature [%s]", err)
 	}
 
-	if S.Cmp(curveHalfOrders[k.(*ecdsaPrivateKey).pub.pub.Curve]) >= 0 {
+	if S.Cmp(utils.GetCurveHalfOrdersAt(k.(*ecdsaPrivateKey).pub.pub.Curve)) >= 0 {
 		t.Fatal("Invalid signature. It must have low-S")
 	}
 
@@ -1121,17 +938,17 @@ func TestECDSALowS(t *testing.T) {
 
 	// Ensure that signature with high-S are rejected.
 	for {
-		R, S, err = signECDSA(k.SKI(), digest)
+		R, S, err = currentBCCSP.(*impl).signP11ECDSA(k.SKI(), digest)
 		if err != nil {
 			t.Fatalf("Failed generating signature [%s]", err)
 		}
 
-		if S.Cmp(curveHalfOrders[k.(*ecdsaPrivateKey).pub.pub.Curve]) > 0 {
+		if S.Cmp(utils.GetCurveHalfOrdersAt(k.(*ecdsaPrivateKey).pub.pub.Curve)) > 0 {
 			break
 		}
 	}
 
-	sig, err := marshalECDSASignature(R, S)
+	sig, err := utils.MarshalECDSASignature(R, S)
 	if err != nil {
 		t.Fatalf("Failing unmarshalling signature [%s]", err)
 	}
@@ -1146,7 +963,6 @@ func TestECDSALowS(t *testing.T) {
 }
 
 func TestAESKeyGen(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1171,7 +987,6 @@ func TestAESKeyGen(t *testing.T) {
 }
 
 func TestAESEncrypt(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1187,7 +1002,6 @@ func TestAESEncrypt(t *testing.T) {
 }
 
 func TestAESDecrypt(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1214,7 +1028,6 @@ func TestAESDecrypt(t *testing.T) {
 }
 
 func TestHMACTruncated256KeyDerivOverAES256Key(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1263,7 +1076,6 @@ func TestHMACTruncated256KeyDerivOverAES256Key(t *testing.T) {
 }
 
 func TestHMACKeyDerivOverAES256Key(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1293,8 +1105,7 @@ func TestHMACKeyDerivOverAES256Key(t *testing.T) {
 }
 
 func TestAES256KeyImport(t *testing.T) {
-
-	raw, err := GetRandomBytes(32)
+	raw, err := sw.GetRandomBytes(32)
 	if err != nil {
 		t.Fatalf("Failed generating AES key [%s]", err)
 	}
@@ -1341,7 +1152,6 @@ func TestAES256KeyImport(t *testing.T) {
 }
 
 func TestAES256KeyImportBadPaths(t *testing.T) {
-
 	_, err := currentBCCSP.KeyImport(nil, &bccsp.AES256ImportKeyOpts{Temporary: false})
 	if err == nil {
 		t.Fatal("Failed importing key. Must fail on importing nil key")
@@ -1354,7 +1164,6 @@ func TestAES256KeyImportBadPaths(t *testing.T) {
 }
 
 func TestAES256KeyGenSKI(t *testing.T) {
-
 	k, err := currentBCCSP.KeyGen(&bccsp.AESKeyGenOpts{Temporary: false})
 	if err != nil {
 		t.Fatalf("Failed generating AES_256 key [%s]", err)
@@ -1382,9 +1191,8 @@ func TestAES256KeyGenSKI(t *testing.T) {
 }
 
 func TestSHA(t *testing.T) {
-
 	for i := 0; i < 100; i++ {
-		b, err := GetRandomBytes(i)
+		b, err := sw.GetRandomBytes(i)
 		if err != nil {
 			t.Fatalf("Failed getting random bytes [%s]", err)
 		}
@@ -1424,539 +1232,4 @@ func TestSHA(t *testing.T) {
 			t.Fatalf("Discrempancy found in HASH result [%x], [%x]!=[%x]", b, h1, h2)
 		}
 	}
-}
-
-func TestRSAKeyGenEphemeral(t *testing.T) {
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: true})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-	if k == nil {
-		t.Fatal("Failed generating RSA key. Key must be different from nil")
-	}
-	if !k.Private() {
-		t.Fatal("Failed generating RSA key. Key should be private")
-	}
-	if k.Symmetric() {
-		t.Fatal("Failed generating RSA key. Key should be asymmetric")
-	}
-
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed generating RSA corresponding public key [%s]", err)
-	}
-	if pk == nil {
-		t.Fatal("PK must be diffrent from nil")
-	}
-
-	b, err := k.Bytes()
-	if err == nil {
-		t.Fatal("Secret keys cannot be exported. It must fail in this case")
-	}
-	if len(b) != 0 {
-		t.Fatal("Secret keys cannot be exported. It must be nil")
-	}
-
-}
-
-func TestRSAPublicKeyInvalidBytes(t *testing.T) {
-	rsaKey := &rsaPublicKey{nil}
-	b, err := rsaKey.Bytes()
-	if err == nil {
-		t.Fatal("It must fail in this case")
-	}
-	if len(b) != 0 {
-		t.Fatal("It must be nil")
-	}
-}
-
-func TestRSAPrivateKeySKI(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	ski := k.SKI()
-	if len(ski) == 0 {
-		t.Fatal("SKI not valid. Zero length.")
-	}
-}
-
-func TestRSAKeyGenNonEphemeral(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-	if k == nil {
-		t.Fatal("Failed generating RSA key. Key must be different from nil")
-	}
-	if !k.Private() {
-		t.Fatal("Failed generating RSA key. Key should be private")
-	}
-	if k.Symmetric() {
-		t.Fatal("Failed generating RSA key. Key should be asymmetric")
-	}
-}
-
-func TestRSAGetKeyBySKI(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	k2, err := currentBCCSP.GetKey(k.SKI())
-	if err != nil {
-		t.Fatalf("Failed getting RSA key [%s]", err)
-	}
-	if k2 == nil {
-		t.Fatal("Failed getting RSA key. Key must be different from nil")
-	}
-	if !k2.Private() {
-		t.Fatal("Failed getting RSA key. Key should be private")
-	}
-	if k2.Symmetric() {
-		t.Fatal("Failed getting RSA key. Key should be asymmetric")
-	}
-
-	// Check that the SKIs are the same
-	if !bytes.Equal(k.SKI(), k2.SKI()) {
-		t.Fatalf("SKIs are different [%x]!=[%x]", k.SKI(), k2.SKI())
-	}
-}
-
-func TestRSAPublicKeyFromPrivateKey(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting public key from private RSA key [%s]", err)
-	}
-	if pk == nil {
-		t.Fatal("Failed getting public key from private RSA key. Key must be different from nil")
-	}
-	if pk.Private() {
-		t.Fatal("Failed generating RSA key. Key should be public")
-	}
-	if pk.Symmetric() {
-		t.Fatal("Failed generating RSA key. Key should be asymmetric")
-	}
-}
-
-func TestRSAPublicKeyBytes(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting public key from private RSA key [%s]", err)
-	}
-
-	raw, err := pk.Bytes()
-	if err != nil {
-		t.Fatalf("Failed marshalling RSA public key [%s]", err)
-	}
-	if len(raw) == 0 {
-		t.Fatal("Failed marshalling RSA public key. Zero length")
-	}
-}
-
-func TestRSAPublicKeySKI(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting public key from private RSA key [%s]", err)
-	}
-
-	ski := pk.SKI()
-	if len(ski) == 0 {
-		t.Fatal("SKI not valid. Zero length.")
-	}
-}
-
-func TestRSASign(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(k, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed generating RSA signature [%s]", err)
-	}
-	if len(signature) == 0 {
-		t.Fatal("Failed generating RSA key. Signature must be different from nil")
-	}
-}
-
-func TestRSAVerify(t *testing.T) {
-
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(k, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed generating RSA signature [%s]", err)
-	}
-
-	valid, err := currentBCCSP.Verify(k, signature, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed verifying RSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying RSA signature. Signature not valid.")
-	}
-
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting corresponding public key [%s]", err)
-	}
-
-	valid, err = currentBCCSP.Verify(pk, signature, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed verifying RSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying RSA signature. Signature not valid.")
-	}
-
-	// Store public key
-	err = currentKS.StoreKey(pk)
-	if err != nil {
-		t.Fatalf("Failed storing corresponding public key [%s]", err)
-	}
-
-	pk2, err := currentKS.GetKey(pk.SKI())
-	if err != nil {
-		t.Fatalf("Failed retrieving corresponding public key [%s]", err)
-	}
-
-	valid, err = currentBCCSP.Verify(pk2, signature, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed verifying RSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying RSA signature. Signature not valid.")
-	}
-
-}
-
-func TestRSAKeyImportFromRSAPublicKey(t *testing.T) {
-
-	// Generate an RSA key
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	// Export the public key
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting RSA public key [%s]", err)
-	}
-
-	pkRaw, err := pk.Bytes()
-	if err != nil {
-		t.Fatalf("Failed getting RSA raw public key [%s]", err)
-	}
-
-	pub, err := utils.DERToPublicKey(pkRaw)
-	if err != nil {
-		t.Fatalf("Failed converting raw to RSA.PublicKey [%s]", err)
-	}
-
-	// Import the RSA.PublicKey
-	pk2, err := currentBCCSP.KeyImport(pub, &bccsp.RSAGoPublicKeyImportOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed importing RSA public key [%s]", err)
-	}
-	if pk2 == nil {
-		t.Fatal("Failed importing RSA public key. Return BCCSP key cannot be nil.")
-	}
-
-	// Sign and verify with the imported public key
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(k, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed generating RSA signature [%s]", err)
-	}
-
-	valid, err := currentBCCSP.Verify(pk2, signature, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed verifying RSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying RSA signature. Signature not valid.")
-	}
-}
-
-func TestKeyImportFromX509RSAPublicKey(t *testing.T) {
-
-	// Generate an RSA key
-	k, err := currentBCCSP.KeyGen(&bccsp.RSAKeyGenOpts{Temporary: false})
-	if err != nil {
-		t.Fatalf("Failed generating RSA key [%s]", err)
-	}
-
-	// Generate a self-signed certificate
-	testExtKeyUsage := []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth}
-	testUnknownExtKeyUsage := []asn1.ObjectIdentifier{[]int{1, 2, 3}, []int{2, 59, 1}}
-	extraExtensionData := []byte("extra extension")
-	commonName := "test.example.com"
-	template := x509.Certificate{
-		SerialNumber: big.NewInt(1),
-		Subject: pkix.Name{
-			CommonName:   commonName,
-			Organization: []string{"Σ Acme Co"},
-			Country:      []string{"US"},
-			ExtraNames: []pkix.AttributeTypeAndValue{
-				{
-					Type:  []int{2, 5, 4, 42},
-					Value: "Gopher",
-				},
-				// This should override the Country, above.
-				{
-					Type:  []int{2, 5, 4, 6},
-					Value: "NL",
-				},
-			},
-		},
-		NotBefore: time.Now().Add(-1 * time.Hour),
-		NotAfter:  time.Now().Add(1 * time.Hour),
-
-		SignatureAlgorithm: x509.SHA256WithRSA,
-
-		SubjectKeyId: []byte{1, 2, 3, 4},
-		KeyUsage:     x509.KeyUsageCertSign,
-
-		ExtKeyUsage:        testExtKeyUsage,
-		UnknownExtKeyUsage: testUnknownExtKeyUsage,
-
-		BasicConstraintsValid: true,
-		IsCA: true,
-
-		OCSPServer:            []string{"http://ocurrentBCCSP.example.com"},
-		IssuingCertificateURL: []string{"http://crt.example.com/ca1.crt"},
-
-		DNSNames:       []string{"test.example.com"},
-		EmailAddresses: []string{"gopher@golang.org"},
-		IPAddresses:    []net.IP{net.IPv4(127, 0, 0, 1).To4(), net.ParseIP("2001:4860:0:2001::68")},
-
-		PolicyIdentifiers:   []asn1.ObjectIdentifier{[]int{1, 2, 3}},
-		PermittedDNSDomains: []string{".example.com", "example.com"},
-
-		CRLDistributionPoints: []string{"http://crl1.example.com/ca1.crl", "http://crl2.example.com/ca1.crl"},
-
-		ExtraExtensions: []pkix.Extension{
-			{
-				Id:    []int{1, 2, 3, 4},
-				Value: extraExtensionData,
-			},
-		},
-	}
-
-	cryptoSigner := &signer.CryptoSigner{}
-	err = cryptoSigner.Init(currentBCCSP, k)
-	if err != nil {
-		t.Fatalf("Failed initializing CyrptoSigner [%s]", err)
-	}
-
-	// Export the public key
-	pk, err := k.PublicKey()
-	if err != nil {
-		t.Fatalf("Failed getting RSA public key [%s]", err)
-	}
-
-	pkRaw, err := pk.Bytes()
-	if err != nil {
-		t.Fatalf("Failed getting RSA raw public key [%s]", err)
-	}
-
-	pub, err := utils.DERToPublicKey(pkRaw)
-	if err != nil {
-		t.Fatalf("Failed converting raw to RSA.PublicKey [%s]", err)
-	}
-
-	certRaw, err := x509.CreateCertificate(rand.Reader, &template, &template, pub, cryptoSigner)
-	if err != nil {
-		t.Fatalf("Failed generating self-signed certificate [%s]", err)
-	}
-
-	cert, err := utils.DERToX509Certificate(certRaw)
-	if err != nil {
-		t.Fatalf("Failed generating X509 certificate object from raw [%s]", err)
-	}
-
-	// Import the certificate's public key
-	pk2, err := currentBCCSP.KeyImport(cert, &bccsp.X509PublicKeyImportOpts{Temporary: false})
-
-	if err != nil {
-		t.Fatalf("Failed importing RSA public key [%s]", err)
-	}
-	if pk2 == nil {
-		t.Fatal("Failed importing RSA public key. Return BCCSP key cannot be nil.")
-	}
-
-	// Sign and verify with the imported public key
-	msg := []byte("Hello World")
-
-	digest, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	signature, err := currentBCCSP.Sign(k, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed generating RSA signature [%s]", err)
-	}
-
-	valid, err := currentBCCSP.Verify(pk2, signature, digest, &rsa.PSSOptions{SaltLength: 32, Hash: getCryptoHashIndex(t)})
-	if err != nil {
-		t.Fatalf("Failed verifying RSA signature [%s]", err)
-	}
-	if !valid {
-		t.Fatal("Failed verifying RSA signature. Signature not valid.")
-	}
-}
-
-func TestGetHashAndHashCompatibility(t *testing.T) {
-
-	msg1 := []byte("abcd")
-	msg2 := []byte("efgh")
-	msg := []byte("abcdefgh")
-
-	digest1, err := currentBCCSP.Hash(msg, &bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	digest2, err := currentBCCSP.Hash(msg, nil)
-	if err != nil {
-		t.Fatalf("Failed computing HASH [%s]", err)
-	}
-
-	if !bytes.Equal(digest1, digest2) {
-		t.Fatalf("Different hash computed. [%x][%x]", digest1, digest2)
-	}
-
-	h, err := currentBCCSP.GetHash(nil)
-	if err != nil {
-		t.Fatalf("Failed getting hash.Hash instance [%s]", err)
-	}
-	h.Write(msg1)
-	h.Write(msg2)
-	digest3 := h.Sum(nil)
-
-	h2, err := currentBCCSP.GetHash(&bccsp.SHAOpts{})
-	if err != nil {
-		t.Fatalf("Failed getting SHA hash.Hash instance [%s]", err)
-	}
-	h2.Write(msg1)
-	h2.Write(msg2)
-	digest4 := h2.Sum(nil)
-
-	if !bytes.Equal(digest3, digest4) {
-		t.Fatalf("Different hash computed. [%x][%x]", digest3, digest4)
-	}
-
-	if !bytes.Equal(digest1, digest3) {
-		t.Fatalf("Different hash computed. [%x][%x]", digest1, digest3)
-	}
-}
-
-func getCryptoHashIndex(t *testing.T) crypto.Hash {
-	switch currentTestConfig.hashFamily {
-	case "SHA2":
-		switch currentTestConfig.securityLevel {
-		case 256:
-			return crypto.SHA256
-		case 384:
-			return crypto.SHA384
-		default:
-			t.Fatalf("Invalid security level [%d]", currentTestConfig.securityLevel)
-		}
-	case "SHA3":
-		switch currentTestConfig.securityLevel {
-		case 256:
-			return crypto.SHA3_256
-		case 384:
-			return crypto.SHA3_384
-		default:
-			t.Fatalf("Invalid security level [%d]", currentTestConfig.securityLevel)
-		}
-	default:
-		t.Fatalf("Invalid hash family [%s]", currentTestConfig.hashFamily)
-	}
-
-	return crypto.SHA3_256
-}
-
-var enablePKCS11tests = false
-
-func findPKCS11Lib() (lib, pin, label string) {
-	//FIXME: Till we workout the configuration piece, look for the libraries in the familiar places
-	lib = os.Getenv("PKCS11_LIB")
-	if lib == "" {
-		pin = "98765432"
-		label = "ForFabric"
-		possibilities := []string{
-			"/usr/lib/softhsm/libsofthsm2.so",                            //Debian
-			"/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",           //Ubuntu
-			"/usr/lib/s390x-linux-gnu/softhsm/libsofthsm2.so",            //Ubuntu
-			"/usr/lib/powerpc64le-linux-gnu/softhsm/libsofthsm2.so",      //Power
-			"/usr/local/Cellar/softhsm/2.1.0/lib/softhsm/libsofthsm2.so", //MacOS
-		}
-		for _, path := range possibilities {
-			if _, err := os.Stat(path); !os.IsNotExist(err) {
-				lib = path
-				enablePKCS11tests = true
-				break
-			}
-		}
-		if lib == "" {
-			enablePKCS11tests = false
-		}
-	} else {
-		enablePKCS11tests = true
-		pin = os.Getenv("PKCS11_PIN")
-		label = os.Getenv("PKCS11_LABEL")
-	}
-	return lib, pin, label
 }

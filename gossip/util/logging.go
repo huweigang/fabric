@@ -1,77 +1,82 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package util
 
 import (
-	"io/ioutil"
-	"log"
 	"sync"
 
 	"github.com/hyperledger/fabric/common/flogging"
-	"github.com/op/go-logging"
-	"google.golang.org/grpc/grpclog"
+	"go.uber.org/zap/zapcore"
 )
 
-// Module names for logger initialization.
+// Logger names for logger initialization.
 const (
-	LoggingChannelModule   = "gossip/channel"
-	LoggingCommModule      = "gossip/comm"
-	LoggingDiscoveryModule = "gossip/discovery"
-	LoggingElectionModule  = "gossip/election"
-	LoggingGossipModule    = "gossip/gossip"
-	LoggingMockModule      = "gossip/comm/mock"
-	LoggingPullModule      = "gossip/pull"
-	LoggingServiceModule   = "gossip/service"
-	LoggingStateModule     = "gossip/state"
+	ChannelLogger     = "gossip.channel"
+	CommLogger        = "gossip.comm"
+	DiscoveryLogger   = "gossip.discovery"
+	ElectionLogger    = "gossip.election"
+	GossipLogger      = "gossip.gossip"
+	CommMockLogger    = "gossip.comm.mock"
+	PullLogger        = "gossip.pull"
+	ServiceLogger     = "gossip.service"
+	StateLogger       = "gossip.state"
+	PrivateDataLogger = "gossip.privdata"
 )
 
-var loggersByModules = make(map[string]*logging.Logger)
+var loggers = make(map[string]Logger)
 var lock = sync.Mutex{}
-var logger = logging.MustGetLogger("gossip/util")
+var testMode bool
 
-// defaultSpec is used to set the default logging level for all the
-// gossip modules.
-var defaultSpec = "WARNING"
+// defaultTestSpec is the default logging level for gossip tests
+var defaultTestSpec = "WARNING"
 
-func init() {
-	// This make sure we get a "leveled" logging using the default
-	// format and output location defined in the flogging package,
-	// when the gossip module is not called from a peer process.
-	flogging.InitFromSpec(defaultSpec)
-	logger.Debugf("Setting default logging level to %s.", defaultSpec)
-
-	grpclog.SetLogger(log.New(ioutil.Discard, "", 0))
+type Logger interface {
+	Debug(args ...interface{})
+	Debugf(format string, args ...interface{})
+	Error(args ...interface{})
+	Errorf(format string, args ...interface{})
+	Fatal(args ...interface{})
+	Fatalf(format string, args ...interface{})
+	Info(args ...interface{})
+	Infof(format string, args ...interface{})
+	Panic(args ...interface{})
+	Panicf(format string, args ...interface{})
+	Warning(args ...interface{})
+	Warningf(format string, args ...interface{})
+	IsEnabledFor(l zapcore.Level) bool
+	With(args ...interface{}) *flogging.FabricLogger
 }
 
-// GetLogger returns a logger for given gossip module and peerID
-func GetLogger(module string, peerID string) *logging.Logger {
-	if peerID != "" {
-		module = module + "#" + peerID
+// GetLogger returns a logger for given gossip logger name and peerID
+func GetLogger(name string, peerID string) Logger {
+	if peerID != "" && testMode {
+		name = name + "#" + peerID
 	}
 
 	lock.Lock()
 	defer lock.Unlock()
 
-	if lgr, ok := loggersByModules[module]; ok {
+	if lgr, ok := loggers[name]; ok {
 		return lgr
 	}
 
 	// Logger doesn't exist, create a new one
-	lgr := logging.MustGetLogger(module)
-	loggersByModules[module] = lgr
+	lgr := flogging.MustGetLogger(name)
+	loggers[name] = lgr
 	return lgr
+}
+
+// SetupTestLogging sets the default log levels for gossip unit tests to defaultTestSpec
+func SetupTestLogging() {
+	SetupTestLoggingWithLevel(defaultTestSpec)
+}
+
+// SetupTestLoggingWithLevel sets the default log levels for gossip unit tests to level
+func SetupTestLoggingWithLevel(level string) {
+	testMode = true
+	flogging.ActivateSpec(level)
 }

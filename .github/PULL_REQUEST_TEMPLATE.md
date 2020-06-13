@@ -1,26 +1,47 @@
-<!-- Provide a general summary of your changes in the Title above -->
+<!--- DELETE MARKDOWN COMMENTS BEFORE SUBMITTING PULL REQUEST. -->
 
-## Description
-<!-- Describe your changes in detail. -->
+<!--- Provide a descriptive summary of your changes in the Title above. -->
 
-## Motivation and Context
-<!-- Why is this change required? What problem does it solve? -->
-<!-- If it fixes an open issue, please link to the issue here. -->
-Fixes #
+#### Type of change
 
-## How Has This Been Tested?
-<!-- If this PR does not contain a new test case, explain why. -->
-<!-- Describe in detail how you tested your changes. -->
+<!--- What type of change? Pick one option and delete the others. -->
 
-## Checklist:
-<!-- To check a box, and an 'x': [x] -->
-<!-- To uncheck box, add a space: [ ] -->
-<!-- If you're unsure about any of these, don't hesitate to ask. We're here to help! -->
-- [] I have added a [Signed-off-by](https://github.com/hyperledger/fabric/blob/master/CONTRIBUTING.md#legal-stuff).
-- [] I have either added documentation to cover my changes or this change requires no new documentation.
-- [] I have either added unit tests to cover my changes or this change requires no new tests.
-- [] I have run [golint](https://github.com/golang/lint) and have fixed valid warnings in code I have added or modified. This tool generates false positives so you may choose to ignore some warnings. The goal is clean, consistent, and readable code.
+- Bug fix
+- New feature
+- Improvement (improvement to code, performance, etc)
+- Test update
+- Documentation update
 
-<!-- The continuous integration build process will run [make checks](https://github.com/hyperledger/fabric/blob/master/Makefile#L22) to confirm that tests pass and that code quality meets minimum standards. You may optionally run this locally as PRs will not be accepted until they pass. -->
+#### Description
 
-Signed-off-by:
+<!--- Describe your changes in detail, including motivation. -->
+
+#### Additional details
+
+<!--- Additional implementation details or comments to reviewers. -->
+<!--- Summarize how the pull request was tested (if not obvious from commit). -->
+
+#### Related issues
+
+<!--- Include a link to any associated issues, e.g. Jira issue or approved rfc. -->
+
+<!---
+#### Release Note
+If change impacts current users, uncomment Release Note heading and provide
+release note text.
+Also, copy release note text into the release specific /release_notes file.
+-->
+
+<!--
+Checklist (DELETE AFTER READING):
+
+- `Signed-off-by` added to commits (required for DCO check to pass)
+- Tests have been added/updated (required for bug fixes and features)
+- Unit and/or integration tests pass locally
+- Run linters and checks locally using 'make checks'
+- If change requires documentation updates, make updates in pull request,
+  or open a separate issue and provide link
+- Squash commits into a single commit, unless a stack of commits is
+  intentional to assist reviewers or to preserve review comments.
+- For additional contribution guidelines see the project's CONTRIBUTING.md file
+-->

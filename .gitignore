@@ -1,37 +1,27 @@
-# Local build binaries
-node-cli/node-cli
-*.pyc
-/build/*
-/bin
-.idea
-*.iml
-.DS_Store
-tags
-.tags
-.vagrant/
-/build
-# Emacs backup files
+#SPDX-License-Identifier: Apache-2.0
+.#*
 *~
 *#
-.#*
-# Vim file artifacts
-.*.sw*
-# bddtest log files
-*.log
-# bddtest coverage files
-bddtests/coverage
-# bddtest Dockerfile
-bddtests/environments/kafka/Dockerfile
+/bin
+/build
+/.build
 *.cov
-# Makefile dummy artifacts
+/docs/build/*
+.DS_Store
 .*-dummy
-# go-carpet output files
-go-carpet-coverage*
-# make node-sdk copied files
-sdk/node/lib/protos/*
-report.xml
-.settings
-.project
 .gradle
-build/
-bin/
+.idea
+*.iml
+*.log
+.project
+/release
+report.xml
+results.xml
+.settings
+.*.sw*
+tags
+.tags
+TESTS*.xml
+.tox/
+.vagrant/
+.vscode

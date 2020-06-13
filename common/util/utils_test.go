@@ -18,19 +18,25 @@ package util
 
 import (
 	"bytes"
-	"strings"
 	"testing"
 	"time"
-
-	"github.com/op/go-logging"
 )
 
-func TestComputeCryptoHash(t *testing.T) {
-	if bytes.Compare(ComputeSHA256([]byte("foobar")), ComputeSHA256([]byte("foobar"))) != 0 {
+func TestComputeSHA256(t *testing.T) {
+	if !bytes.Equal(ComputeSHA256([]byte("foobar")), ComputeSHA256([]byte("foobar"))) {
 		t.Fatalf("Expected hashes to match, but they did not match")
 	}
-	if bytes.Compare(ComputeSHA256([]byte("foobar1")), ComputeSHA256([]byte("foobar2"))) == 0 {
+	if bytes.Equal(ComputeSHA256([]byte("foobar1")), ComputeSHA256([]byte("foobar2"))) {
 		t.Fatalf("Expected hashes to be different, but they match")
+	}
+}
+
+func TestComputeSHA3256(t *testing.T) {
+	if !bytes.Equal(ComputeSHA3256([]byte("foobar")), ComputeSHA3256([]byte("foobar"))) {
+		t.Fatalf("Expected hashes to match, but they did not match")
+	}
+	if bytes.Equal(ComputeSHA3256([]byte("foobar1")), ComputeSHA3256([]byte("foobar2"))) {
+		t.Fatalf("Expected hashed to be different, but they match")
 	}
 }
 
@@ -45,14 +51,6 @@ func TestUUIDGeneration(t *testing.T) {
 	}
 }
 
-func TestIntUUIDGeneration(t *testing.T) {
-	uuid := GenerateIntUUID()
-
-	uuid2 := GenerateIntUUID()
-	if uuid == uuid2 {
-		t.Fatalf("Two UUIDs are equal. This should never occur")
-	}
-}
 func TestTimestamp(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		t.Logf("timestamp now: %v", CreateUtcTimestamp())
@@ -60,66 +58,20 @@ func TestTimestamp(t *testing.T) {
 	}
 }
 
-func TestGenerateHashFromSignature(t *testing.T) {
-	if bytes.Compare(GenerateHashFromSignature("aPath", []byte("aCtor12")),
-		GenerateHashFromSignature("aPath", []byte("aCtor12"))) != 0 {
-		t.Fatalf("Expected hashes to match, but they did not match")
+func TestToChaincodeArgs(t *testing.T) {
+	expected := [][]byte{[]byte("foo"), []byte("bar")}
+	actual := ToChaincodeArgs("foo", "bar")
+	if len(expected) != len(actual) {
+		t.Fatalf("Got %v, expected %v", actual, expected)
 	}
-	if bytes.Compare(GenerateHashFromSignature("aPath", []byte("aCtor12")),
-		GenerateHashFromSignature("bPath", []byte("bCtor34"))) == 0 {
-		t.Fatalf("Expected hashes to be different, but they match")
-	}
-}
-
-func TestGeneratIDfromTxSHAHash(t *testing.T) {
-	txid := GenerateIDfromTxSHAHash([]byte("foobar"))
-	txid2 := GenerateIDfromTxSHAHash([]byte("foobar1"))
-	if txid == txid2 {
-		t.Fatalf("Two TxIDs are equal. This should never occur")
-	}
-}
-
-func TestGenerateIDWithAlg(t *testing.T) {
-	_, err := GenerateIDWithAlg("sha256", []byte{1, 1, 1, 1})
-	if err != nil {
-		t.Fatalf("Decoder failure: %v", err)
-	}
-}
-
-func TestFindMissingElements(t *testing.T) {
-	all := []string{"a", "b", "c", "d"}
-	some := []string{"b", "c"}
-	expectedDelta := []string{"a", "d"}
-	actualDelta := FindMissingElements(all, some)
-	if len(expectedDelta) != len(actualDelta) {
-		t.Fatalf("Got %v, expected %v", actualDelta, expectedDelta)
-	}
-	for i := range expectedDelta {
-		if strings.Compare(expectedDelta[i], actualDelta[i]) != 0 {
-			t.Fatalf("Got %v, expected %v", actualDelta, expectedDelta)
+	for i := range expected {
+		if !bytes.Equal(expected[i], actual[i]) {
+			t.Fatalf("Got %v, expected %v", actual, expected)
 		}
 	}
 }
 
-// This test checks go-logging is thread safe with regard to
-// concurrent SetLevel invocation and log invocations.
-// Fails without the concurrency fix (adding RWLock to level.go)
-// In case the go-logging will be overwritten and its concurrency fix
-// will be regressed, this test should fail.
-func TestConcurrencyNotFail(t *testing.T) {
-	logger := logging.MustGetLogger("test")
-	go func() {
-		for i := 0; i < 100; i++ {
-			logging.SetLevel(logging.Level(logging.DEBUG), "test")
-		}
-	}()
-
-	for i := 0; i < 100; i++ {
-		logger.Info("")
-	}
-}
-
-func TestMetadataSignatureBytesNormal(t *testing.T) {
+func TestConcatenateBytesNormal(t *testing.T) {
 	first := []byte("first")
 	second := []byte("second")
 	third := []byte("third")
@@ -131,7 +83,7 @@ func TestMetadataSignatureBytesNormal(t *testing.T) {
 	}
 }
 
-func TestMetadataSignatureBytesNil(t *testing.T) {
+func TestConcatenateBytesNil(t *testing.T) {
 	first := []byte("first")
 	second := []byte(nil)
 	third := []byte("third")

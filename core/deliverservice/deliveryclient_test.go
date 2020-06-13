@@ -1,75 +1,229 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
-package deliverclient
+package deliverservice
 
 import (
-	"sync/atomic"
+	"fmt"
 	"testing"
 	"time"
 
-	"github.com/docker/docker/pkg/testutil/assert"
-	"github.com/hyperledger/fabric/core/deliverservice/blocksprovider"
-	"github.com/hyperledger/fabric/core/deliverservice/mocks"
-	"github.com/spf13/viper"
+	"github.com/hyperledger/fabric/core/deliverservice/fake"
+	"github.com/hyperledger/fabric/internal/pkg/comm"
+	"github.com/hyperledger/fabric/internal/pkg/peer/blocksprovider"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-type mockBlocksDelivererFactory struct {
-	mockCreate func() (blocksprovider.BlocksDeliverer, error)
+//go:generate counterfeiter -o fake/ledger_info.go --fake-name LedgerInfo . ledgerInfo
+type ledgerInfo interface {
+	blocksprovider.LedgerInfo
 }
 
-func (mock *mockBlocksDelivererFactory) Create() (blocksprovider.BlocksDeliverer, error) {
-	return mock.mockCreate()
+func TestStartDeliverForChannel(t *testing.T) {
+	fakeLedgerInfo := &fake.LedgerInfo{}
+	fakeLedgerInfo.LedgerHeightReturns(0, fmt.Errorf("fake-ledger-error"))
+
+	grpcClient, err := comm.NewGRPCClient(comm.ClientConfig{
+		SecOpts: comm.SecureOptions{
+			UseTLS:            true,
+			RequireClientCert: true,
+			// The below certificates were taken from the peer TLS
+			// dir as output by cryptogen.
+			// They are server.crt and server.key respectively.
+			Certificate: []byte(`-----BEGIN CERTIFICATE-----
+MIIChTCCAiygAwIBAgIQOrr7/tDzKhhCba04E6QVWzAKBggqhkjOPQQDAjB2MQsw
+CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
+YW5jaXNjbzEZMBcGA1UEChMQb3JnMS5leGFtcGxlLmNvbTEfMB0GA1UEAxMWdGxz
+Y2Eub3JnMS5leGFtcGxlLmNvbTAeFw0xOTA4MjcyMDA2MDBaFw0yOTA4MjQyMDA2
+MDBaMFsxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
+Ew1TYW4gRnJhbmNpc2NvMR8wHQYDVQQDExZwZWVyMC5vcmcxLmV4YW1wbGUuY29t
+MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAExglppLxiAYSasrdFsrZJDxRULGBb
+wHlArrap9SmAzGIeeIuqe9t3F23Q5Jry9lAnIh8h3UlkvZZpClXcjRiCeqOBtjCB
+szAOBgNVHQ8BAf8EBAMCBaAwHQYDVR0lBBYwFAYIKwYBBQUHAwEGCCsGAQUFBwMC
+MAwGA1UdEwEB/wQCMAAwKwYDVR0jBCQwIoAgL35aqafj6SNnWdI4aMLh+oaFJvsA
+aoHgYMkcPvvkiWcwRwYDVR0RBEAwPoIWcGVlcjAub3JnMS5leGFtcGxlLmNvbYIF
+cGVlcjCCFnBlZXIwLm9yZzEuZXhhbXBsZS5jb22CBXBlZXIwMAoGCCqGSM49BAMC
+A0cAMEQCIAiAGoYeKPMd3bqtixZji8q2zGzLmIzq83xdTJoZqm50AiAKleso2EVi
+2TwsekWGpMaCOI6JV1+ZONyti6vBChhUYg==
+-----END CERTIFICATE-----`),
+			Key: []byte(`-----BEGIN PRIVATE KEY-----
+MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgxiyAFyD0Eg1NxjbS
+U2EKDLoTQr3WPK8z7WyeOSzr+GGhRANCAATGCWmkvGIBhJqyt0WytkkPFFQsYFvA
+eUCutqn1KYDMYh54i6p723cXbdDkmvL2UCciHyHdSWS9lmkKVdyNGIJ6
+-----END PRIVATE KEY-----`,
+			),
+		},
+	})
+	require.NoError(t, err)
+
+	t.Run("Green Path With Mutual TLS", func(t *testing.T) {
+		ds := NewDeliverService(&Config{
+			DeliverGRPCClient:    grpcClient,
+			DeliverServiceConfig: &DeliverServiceConfig{},
+		}).(*deliverServiceImpl)
+
+		finalized := make(chan struct{})
+		err := ds.StartDeliverForChannel("channel-id", fakeLedgerInfo, func() {
+			close(finalized)
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-finalized:
+		case <-time.After(time.Second):
+			assert.FailNow(t, "finalizer should have executed")
+		}
+
+		bp, ok := ds.blockProviders["channel-id"]
+		require.True(t, ok, "map entry must exist")
+		assert.Equal(t, "76f7a03f8dfdb0ef7c4b28b3901fe163c730e906c70e4cdf887054ad5f608bed", fmt.Sprintf("%x", bp.TLSCertHash))
+	})
+
+	t.Run("Green Path without mutual TLS", func(t *testing.T) {
+		grpcClient, err := comm.NewGRPCClient(comm.ClientConfig{
+			SecOpts: comm.SecureOptions{
+				UseTLS: true,
+			},
+		})
+		require.NoError(t, err)
+
+		ds := NewDeliverService(&Config{
+			DeliverGRPCClient:    grpcClient,
+			DeliverServiceConfig: &DeliverServiceConfig{},
+		}).(*deliverServiceImpl)
+
+		finalized := make(chan struct{})
+		err = ds.StartDeliverForChannel("channel-id", fakeLedgerInfo, func() {
+			close(finalized)
+		})
+		require.NoError(t, err)
+
+		select {
+		case <-finalized:
+		case <-time.After(time.Second):
+			assert.FailNow(t, "finalizer should have executed")
+		}
+
+		bp, ok := ds.blockProviders["channel-id"]
+		require.True(t, ok, "map entry must exist")
+		assert.Nil(t, bp.TLSCertHash)
+	})
+
+	t.Run("Exists", func(t *testing.T) {
+		ds := NewDeliverService(&Config{
+			DeliverGRPCClient:    grpcClient,
+			DeliverServiceConfig: &DeliverServiceConfig{},
+		}).(*deliverServiceImpl)
+
+		err = ds.StartDeliverForChannel("channel-id", fakeLedgerInfo, func() {})
+		require.NoError(t, err)
+
+		err = ds.StartDeliverForChannel("channel-id", fakeLedgerInfo, func() {})
+		assert.EqualError(t, err, "Delivery service - block provider already exists for channel-id found, can't start delivery")
+	})
+
+	t.Run("Stopping", func(t *testing.T) {
+		ds := NewDeliverService(&Config{
+			DeliverGRPCClient:    grpcClient,
+			DeliverServiceConfig: &DeliverServiceConfig{},
+		}).(*deliverServiceImpl)
+
+		ds.Stop()
+
+		err = ds.StartDeliverForChannel("channel-id", fakeLedgerInfo, func() {})
+		assert.EqualError(t, err, "Delivery service is stopping cannot join a new channel channel-id")
+	})
 }
 
-func TestNewDeliverService(t *testing.T) {
-	viper.Set("peer.gossip.orgLeader", true)
+func TestStopDeliverForChannel(t *testing.T) {
+	t.Run("Green path", func(t *testing.T) {
+		ds := NewDeliverService(&Config{}).(*deliverServiceImpl)
+		doneA := make(chan struct{})
+		ds.blockProviders = map[string]*blocksprovider.Deliverer{
+			"a": {
+				DoneC: doneA,
+			},
+			"b": {
+				DoneC: make(chan struct{}),
+			},
+		}
+		err := ds.StopDeliverForChannel("a")
+		assert.NoError(t, err)
+		assert.Len(t, ds.blockProviders, 1)
+		_, ok := ds.blockProviders["a"]
+		assert.False(t, ok)
+		select {
+		case <-doneA:
+		default:
+			assert.Fail(t, "should have stopped the blocksprovider")
+		}
+	})
 
-	gossipServiceAdapter := &mocks.MockGossipServiceAdapter{}
-	factory := &struct{ mockBlocksDelivererFactory }{}
+	t.Run("Already stopping", func(t *testing.T) {
+		ds := NewDeliverService(&Config{}).(*deliverServiceImpl)
+		ds.blockProviders = map[string]*blocksprovider.Deliverer{
+			"a": {
+				DoneC: make(chan struct{}),
+			},
+			"b": {
+				DoneC: make(chan struct{}),
+			},
+		}
 
-	blocksDeliverer := &mocks.MockBlocksDeliverer{}
-	blocksDeliverer.MockRecv = mocks.MockRecv
+		ds.Stop()
+		err := ds.StopDeliverForChannel("a")
+		assert.EqualError(t, err, "Delivery service is stopping, cannot stop delivery for channel a")
+	})
 
-	factory.mockCreate = func() (blocksprovider.BlocksDeliverer, error) {
-		return blocksDeliverer, nil
+	t.Run("Non-existent", func(t *testing.T) {
+		ds := NewDeliverService(&Config{}).(*deliverServiceImpl)
+		ds.blockProviders = map[string]*blocksprovider.Deliverer{
+			"a": {
+				DoneC: make(chan struct{}),
+			},
+			"b": {
+				DoneC: make(chan struct{}),
+			},
+		}
+
+		err := ds.StopDeliverForChannel("c")
+		assert.EqualError(t, err, "Delivery service - no block provider for c found, can't stop delivery")
+	})
+}
+
+func TestStop(t *testing.T) {
+	ds := NewDeliverService(&Config{}).(*deliverServiceImpl)
+	ds.blockProviders = map[string]*blocksprovider.Deliverer{
+		"a": {
+			DoneC: make(chan struct{}),
+		},
+		"b": {
+			DoneC: make(chan struct{}),
+		},
+	}
+	assert.False(t, ds.stopping)
+	for _, bp := range ds.blockProviders {
+		select {
+		case <-bp.DoneC:
+			assert.Fail(t, "block providers should not be closed")
+		default:
+		}
 	}
 
-	service := NewFactoryDeliverService(gossipServiceAdapter, factory, nil)
-	assert.NilError(t, service.StartDeliverForChannel("TEST_CHAINID", &mocks.MockLedgerInfo{0}))
-
-	// Lets start deliver twice
-	assert.Error(t, service.StartDeliverForChannel("TEST_CHAINID", &mocks.MockLedgerInfo{0}), "can't start delivery")
-	// Lets stop deliver that not started
-	assert.Error(t, service.StopDeliverForChannel("TEST_CHAINID2"), "can't stop delivery")
-
-	// Let it try to simulate a few recv -> gossip rounds
-	time.Sleep(time.Duration(10) * time.Millisecond)
-	assert.NilError(t, service.StopDeliverForChannel("TEST_CHAINID"))
-
-	time.Sleep(time.Duration(10) * time.Millisecond)
-	service.Stop()
-
-	// Make sure to stop all blocks providers
-	time.Sleep(time.Duration(500) * time.Millisecond)
-
-	assert.Equal(t, atomic.LoadInt32(&blocksDeliverer.RecvCnt), atomic.LoadInt32(&gossipServiceAdapter.AddPayloadsCnt))
-	assert.Equal(t, atomic.LoadInt32(&blocksDeliverer.RecvCnt), atomic.LoadInt32(&gossipServiceAdapter.GossipCallsCnt))
-
-	assert.Error(t, service.StartDeliverForChannel("TEST_CHAINID", &mocks.MockLedgerInfo{0}), "Delivery service is stopping")
-	assert.Error(t, service.StopDeliverForChannel("TEST_CHAINID"), "Delivery service is stopping")
+	ds.Stop()
+	assert.True(t, ds.stopping)
+	assert.Len(t, ds.blockProviders, 2)
+	for _, bp := range ds.blockProviders {
+		select {
+		case <-bp.DoneC:
+		default:
+			assert.Fail(t, "block providers should te closed")
+		}
+	}
 
 }

@@ -1,270 +1,321 @@
 # Copyright IBM Corp All Rights Reserved.
 # Copyright London Stock Exchange Group All Rights Reserved.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# SPDX-License-Identifier: Apache-2.0
 #
 # -------------------------------------------------------------
 # This makefile defines the following targets
 #
-#   - all (default) - builds all targets and runs all tests/checks
-#   - checks - runs all tests/checks
-#   - peer - builds a native fabric peer binary
-#   - orderer - builds a native fabric orderer binary
-#   - unit-test - runs the go-test based unit tests
-#   - behave - runs the behave test
-#   - behave-deps - ensures pre-requisites are availble for running behave manually
+#   - all (default) - builds all targets and runs all non-integration tests/checks
+#   - basic-checks - performs basic checks like license, spelling, trailing spaces and linter
+#   - check-deps - check for vendored dependencies that are no longer used
+#   - checks - runs all non-integration tests/checks
+#   - clean-all - superset of 'clean' that also removes persistent state
+#   - clean - cleans the build area
+#   - configtxgen - builds a native configtxgen binary
+#   - configtxlator - builds a native configtxlator binary
+#   - cryptogen - builds a native cryptogen binary
+#   - desk-check - runs linters and verify to test changed packages
+#   - dist-clean - clean release packages for all target platforms
+#   - docker[-clean] - ensures all docker images are available[/cleaned]
+#   - docker-list - generates a list of docker images that 'make docker' produces
+#   - docker-tag-latest - re-tags the images made by 'make docker' with the :latest tag
+#   - docker-tag-stable - re-tags the images made by 'make docker' with the :stable tag
+#   - docker-thirdparty - pulls thirdparty images (kafka,zookeeper,couchdb)
 #   - gotools - installs go tools like golint
+#   - help-docs - generate the command reference docs
+#   - idemixgen - builds a native idemixgen binary
+#   - integration-test-prereqs - setup prerequisites for integration tests
+#   - integration-test - runs the integration tests
+#   - license - checks go source files for Apache license header
 #   - linter - runs all code checks
 #   - native - ensures all native binaries are available
-#   - docker[-clean] - ensures all docker images are available[/cleaned]
-#   - peer-docker[-clean] - ensures the peer container is available[/cleaned]
+#   - orderer - builds a native fabric orderer binary
 #   - orderer-docker[-clean] - ensures the orderer container is available[/cleaned]
+#   - peer - builds a native fabric peer binary
+#   - peer-docker[-clean] - ensures the peer container is available[/cleaned]
+#   - profile - runs unit tests for all packages in coverprofile mode (slow)
 #   - protos - generate all protobuf artifacts based on .proto files
-#   - clean - cleans the build area
-#   - dist-clean - superset of 'clean' that also removes persistent state
+#   - publish-images - publishes release docker images to nexus3 or docker hub.
+#   - release-all - builds release packages for all target platforms
+#   - release - builds release packages for the host platform
+#   - tools-docker[-clean] - ensures the tools container is available[/cleaned]
+#   - unit-test-clean - cleans unit test state (particularly from docker)
+#   - unit-test - runs the go-test based unit tests
+#   - verify - runs unit tests for only the changed package tree
 
-PROJECT_NAME   = hyperledger/fabric
-BASE_VERSION   = 0.7.0
-IS_RELEASE     = false
+ALPINE_VER ?= 3.12
+BASE_VERSION = 2.2.0
 
-ifneq ($(IS_RELEASE),true)
-EXTRA_VERSION ?= snapshot-$(shell git rev-parse --short HEAD)
-PROJECT_VERSION=$(BASE_VERSION)-$(EXTRA_VERSION)
-else
-PROJECT_VERSION=$(BASE_VERSION)
-endif
+# 3rd party image version
+# These versions are also set in the runners in ./integration/runners/
+COUCHDB_VER ?= 2.3
+KAFKA_VER ?= 5.3.1
+ZOOKEEPER_VER ?= 5.3.1
 
-PKGNAME = github.com/$(PROJECT_NAME)
-CGO_FLAGS = CGO_CFLAGS=" "
-ARCH=$(shell uname -m)
-CHAINTOOL_RELEASE=v0.10.3
-BASEIMAGE_RELEASE=$(shell cat ./.baseimage-release)
+# Disable implicit rules
+.SUFFIXES:
+MAKEFLAGS += --no-builtin-rules
+
+BUILD_DIR ?= build
+
+EXTRA_VERSION ?= $(shell git rev-parse --short HEAD)
+PROJECT_VERSION=$(BASE_VERSION)-snapshot-$(EXTRA_VERSION)
+
+# TWO_DIGIT_VERSION is derived, e.g. "2.0", especially useful as a local tag
+# for two digit references to most recent baseos and ccenv patch releases
+TWO_DIGIT_VERSION = $(shell echo $(BASE_VERSION) | cut -d '.' -f 1,2)
+
+PKGNAME = github.com/hyperledger/fabric
+ARCH=$(shell go env GOARCH)
+MARCH=$(shell go env GOOS)-$(shell go env GOARCH)
 
 # defined in common/metadata/metadata.go
-METADATA_VAR = Version=$(PROJECT_VERSION)
-METADATA_VAR += BaseVersion=$(BASEIMAGE_RELEASE)
+METADATA_VAR = Version=$(BASE_VERSION)
+METADATA_VAR += CommitSHA=$(EXTRA_VERSION)
 METADATA_VAR += BaseDockerLabel=$(BASE_DOCKER_LABEL)
+METADATA_VAR += DockerNamespace=$(DOCKER_NS)
 
-GO_LDFLAGS = $(patsubst %,-X $(PKGNAME)/common/metadata.%,$(METADATA_VAR))
+GO_VER = 1.14.4
+GO_TAGS ?=
 
-CHAINTOOL_URL ?= https://github.com/hyperledger/fabric-chaintool/releases/download/$(CHAINTOOL_RELEASE)/chaintool
+RELEASE_EXES = orderer $(TOOLS_EXES)
+RELEASE_IMAGES = baseos ccenv orderer peer tools
+RELEASE_PLATFORMS = darwin-amd64 linux-amd64 windows-amd64
+TOOLS_EXES = configtxgen configtxlator cryptogen discover idemixgen peer
 
-export GO_LDFLAGS
+pkgmap.configtxgen    := $(PKGNAME)/cmd/configtxgen
+pkgmap.configtxlator  := $(PKGNAME)/cmd/configtxlator
+pkgmap.cryptogen      := $(PKGNAME)/cmd/cryptogen
+pkgmap.discover       := $(PKGNAME)/cmd/discover
+pkgmap.idemixgen      := $(PKGNAME)/cmd/idemixgen
+pkgmap.orderer        := $(PKGNAME)/cmd/orderer
+pkgmap.peer           := $(PKGNAME)/cmd/peer
 
-EXECUTABLES = go docker git curl
-K := $(foreach exec,$(EXECUTABLES),\
-	$(if $(shell which $(exec)),some string,$(error "No $(exec) in PATH: Check dependencies")))
-
-GOSHIM_DEPS = $(shell ./scripts/goListFiles.sh $(PKGNAME)/core/chaincode/shim)
-JAVASHIM_DEPS =  $(shell git ls-files core/chaincode/shim/java)
-PROTOS = $(shell git ls-files *.proto | grep -v vendor)
-MSP_SAMPLECONFIG = $(shell git ls-files msp/sampleconfig/*)
-PROJECT_FILES = $(shell git ls-files)
-IMAGES = peer orderer ccenv javaenv buildenv testenv zookeeper kafka couchdb
-
-pkgmap.configtxgen    := $(PKGNAME)/common/configtx/tool/configtxgen
-pkgmap.peer           := $(PKGNAME)/peer
-pkgmap.orderer        := $(PKGNAME)/orderer
-pkgmap.block-listener := $(PKGNAME)/examples/events/block-listener
+.DEFAULT_GOAL := all
 
 include docker-env.mk
+include gotools.mk
 
-all: native docker checks
+.PHONY: all
+all: check-go-version native docker checks
 
-checks: linter unit-test behave
+.PHONY: checks
+checks: basic-checks unit-test integration-test
+
+.PHONY: basic-checks
+basic-checks: check-go-version license spelling references trailing-spaces linter check-metrics-doc filename-spaces
+
+.PHONY: desk-checks
+desk-check: checks verify
+
+.PHONY: help-docs
+help-docs: native
+	@scripts/generateHelpDocs.sh
+
+.PHONY: spelling
+spelling: gotool.misspell
+	@scripts/check_spelling.sh
+
+.PHONY: references
+references:
+	@scripts/check_references.sh
+
+.PHONY: license
+license:
+	@scripts/check_license.sh
+
+.PHONY: trailing-spaces
+trailing-spaces:
+	@scripts/check_trailingspaces.sh
 
 .PHONY: gotools
-gotools:
-	mkdir -p build/bin
-	cd gotools && $(MAKE) install BINDIR=$(GOPATH)/bin
+gotools: gotools-install
 
-gotools-clean:
-	cd gotools && $(MAKE) clean
+.PHONY: check-go-version
+check-go-version:
+	@scripts/check_go_version.sh $(GO_VER)
 
-# This is a legacy target left to satisfy existing CI scripts
-membersrvc-image:
-	@echo "membersrvc has been removed from this build"
+.PHONY: integration-test
+integration-test: integration-test-prereqs
+	./scripts/run-integration-tests.sh
 
-.PHONY: peer
-peer: build/bin/peer
-peer-docker: build/image/peer/$(DUMMY)
+.PHONY: integration-test-prereqs
+integration-test-prereqs: gotool.ginkgo baseos-docker ccenv-docker docker-thirdparty
 
-.PHONY: orderer
-orderer: build/bin/orderer
-orderer-docker: build/image/orderer/$(DUMMY)
+.PHONY: unit-test
+unit-test: unit-test-clean docker-thirdparty-couchdb
+	./scripts/run-unit-tests.sh
 
-.PHONY: configtxgen
-configtxgen: build/bin/configtxgen
-
-buildenv: build/image/buildenv/$(DUMMY)
-
-build/image/testenv/$(DUMMY): build/image/buildenv/$(DUMMY)
-testenv: build/image/testenv/$(DUMMY)
-
-couchdb: build/image/couchdb/$(DUMMY)
-
-unit-test: peer-docker testenv couchdb
-	cd unit-test && docker-compose up --abort-on-container-exit --force-recreate && docker-compose down
-
+.PHONY: unit-tests
 unit-tests: unit-test
 
-docker: $(patsubst %,build/image/%/$(DUMMY), $(IMAGES))
-native: peer orderer
+# Pull thirdparty docker images based on the latest baseimage release version
+# Also pull ccenv-1.4 for compatibility test to ensure pre-2.0 installed chaincodes
+# can be built by a peer configured to use the ccenv-1.4 as the builder image.
+.PHONY: docker-thirdparty
+docker-thirdparty: docker-thirdparty-couchdb
+	docker pull confluentinc/cp-zookeeper:${ZOOKEEPER_VER}
+	docker pull confluentinc/cp-kafka:${KAFKA_VER}
+	docker pull hyperledger/fabric-ccenv:1.4
 
-BEHAVE_ENVIRONMENTS = kafka orderer orderer-1-kafka-1 orderer-1-kafka-3
-BEHAVE_ENVIRONMENT_TARGETS = $(patsubst %,bddtests/environments/%, $(BEHAVE_ENVIRONMENTS))
-.PHONY: behave-environments $(BEHAVE_ENVIRONMENT_TARGETS)
-behave-environments: $(BEHAVE_ENVIRONMENT_TARGETS)
-$(BEHAVE_ENVIRONMENT_TARGETS):
-	@docker-compose --file $@/docker-compose.yml build
+.PHONY: docker-thirdparty-couchdb
+docker-thirdparty-couchdb:
+	docker pull couchdb:${COUCHDB_VER}
 
-behave-deps: docker peer build/bin/block-listener behave-environments
-behave: behave-deps
-	@echo "Running behave tests"
-	@cd bddtests; behave $(BEHAVE_OPTS)
+.PHONY: verify
+verify: export JOB_TYPE=VERIFY
+verify: unit-test
 
-behave-peer-chaincode: build/bin/peer peer-docker orderer-docker
-	@cd peer/chaincode && behave
+.PHONY: profile
+profile: export JOB_TYPE=PROFILE
+profile: unit-test
 
-linter: buildenv
+.PHONY: linter
+linter: check-deps gotool.goimports
 	@echo "LINT: Running code checks.."
-	@$(DRUN) hyperledger/fabric-buildenv:$(DOCKER_TAG) ./scripts/golinter.sh
+	./scripts/golinter.sh
 
-%/chaintool: Makefile
-	@echo "Installing chaintool"
-	@mkdir -p $(@D)
-	curl -L $(CHAINTOOL_URL) > $@
-	chmod +x $@
+.PHONY: check-deps
+check-deps:
+	@echo "DEP: Checking for dependency issues.."
+	./scripts/check_deps.sh
 
-# We (re)build a package within a docker context but persist the $GOPATH/pkg
-# directory so that subsequent builds are faster
-build/docker/bin/%: $(PROJECT_FILES)
-	$(eval TARGET = ${patsubst build/docker/bin/%,%,${@}})
-	@echo "Building $@"
-	@mkdir -p build/docker/bin build/docker/$(TARGET)/pkg
-	@$(DRUN) \
-		-v $(abspath build/docker/bin):/opt/gopath/bin \
-		-v $(abspath build/docker/$(TARGET)/pkg):/opt/gopath/pkg \
-		hyperledger/fabric-baseimage:$(BASE_DOCKER_TAG) \
-		go install -ldflags "$(DOCKER_GO_LDFLAGS)" $(pkgmap.$(@F))
-	@touch $@
+.PHONY: check-metrics-docs
+check-metrics-doc:
+	@echo "METRICS: Checking for outdated reference documentation.."
+	./scripts/metrics_doc.sh check
 
-build/bin:
-	mkdir -p $@
-
-build/docker/gotools/bin/protoc-gen-go: build/docker/gotools
-
-build/docker/gotools: gotools/Makefile
-	@mkdir -p $@/bin $@/obj
-	@$(DRUN) \
-		-v $(abspath $@):/opt/gotools \
-		-w /opt/gopath/src/$(PKGNAME)/gotools \
-		hyperledger/fabric-baseimage:$(BASE_DOCKER_TAG) \
-		make install BINDIR=/opt/gotools/bin OBJDIR=/opt/gotools/obj
-
-# Both peer and peer-docker depend on ccenv and javaenv (all docker env images it supports).
-build/bin/peer: build/image/ccenv/$(DUMMY) build/image/javaenv/$(DUMMY)
-build/image/peer/$(DUMMY): build/image/ccenv/$(DUMMY) build/image/javaenv/$(DUMMY)
-
-build/bin/%: $(PROJECT_FILES)
-	@mkdir -p $(@D)
-	@echo "$@"
-	$(CGO_FLAGS) GOBIN=$(abspath $(@D)) go install -ldflags "$(GO_LDFLAGS)" $(pkgmap.$(@F))
-	@echo "Binary available as $@"
-	@touch $@
-
-# payload definitions'
-build/image/ccenv/payload:      build/docker/gotools/bin/protoc-gen-go \
-				build/bin/chaintool \
-				build/goshim.tar.bz2
-build/image/javaenv/payload:    build/javashim.tar.bz2 \
-				build/protos.tar.bz2 \
-				settings.gradle
-build/image/peer/payload:       build/docker/bin/peer \
-				peer/core.yaml \
-				build/msp-sampleconfig.tar.bz2 \
-				common/configtx/tool/configtx.yaml
-build/image/orderer/payload:    build/docker/bin/orderer \
-				build/msp-sampleconfig.tar.bz2 \
-				orderer/orderer.yaml \
-				common/configtx/tool/configtx.yaml
-build/image/buildenv/payload:   build/gotools.tar.bz2 \
-				build/docker/gotools/bin/protoc-gen-go
-build/image/testenv/payload:    build/docker/bin/orderer \
-				orderer/orderer.yaml \
-				common/configtx/tool/configtx.yaml \
-				build/docker/bin/peer \
-				peer/core.yaml \
-				build/msp-sampleconfig.tar.bz2 \
-				images/testenv/install-softhsm2.sh
-build/image/zookeeper/payload:  images/zookeeper/docker-entrypoint.sh
-build/image/kafka/payload:      images/kafka/docker-entrypoint.sh \
-				images/kafka/kafka-run-class.sh
-build/image/couchdb/payload:	images/couchdb/docker-entrypoint.sh \
-				images/couchdb/local.ini \
-				images/couchdb/vm.args
-
-build/image/%/payload:
-	mkdir -p $@
-	cp $^ $@
-
-.PRECIOUS: build/image/%/Dockerfile
-
-build/image/%/Dockerfile: images/%/Dockerfile.in
-	@cat $< \
-		| sed -e 's/_BASE_TAG_/$(BASE_DOCKER_TAG)/g' \
-		| sed -e 's/_TAG_/$(DOCKER_TAG)/g' \
-		> $@
-	@echo LABEL $(BASE_DOCKER_LABEL).version=$(PROJECT_VERSION) \\>>$@
-	@echo "     " $(BASE_DOCKER_LABEL).base.version=$(BASEIMAGE_RELEASE)>>$@
-
-build/image/%/$(DUMMY): Makefile build/image/%/payload build/image/%/Dockerfile
-	$(eval TARGET = ${patsubst build/image/%/$(DUMMY),%,${@}})
-	@echo "Building docker $(TARGET)-image"
-	$(DBUILD) -t $(PROJECT_NAME)-$(TARGET) $(@D)
-	docker tag $(PROJECT_NAME)-$(TARGET) $(PROJECT_NAME)-$(TARGET):$(DOCKER_TAG)
-	@touch $@
-
-build/gotools.tar.bz2: build/docker/gotools
-	(cd $</bin && tar -jc *) > $@
-
-build/goshim.tar.bz2: $(GOSHIM_DEPS)
-	@echo "Creating $@"
-	@tar -jhc -C $(GOPATH)/src $(patsubst $(GOPATH)/src/%,%,$(GOSHIM_DEPS)) > $@
-
-build/javashim.tar.bz2: $(JAVASHIM_DEPS)
-build/protos.tar.bz2: $(PROTOS)
-build/msp-sampleconfig.tar.bz2: $(MSP_SAMPLECONFIG)
-
-build/%.tar.bz2:
-	@echo "Creating $@"
-	@tar -jc $^ > $@
+.PHONY: generate-metrics-docs
+generate-metrics-doc:
+	@echo "Generating metrics reference documentation..."
+	./scripts/metrics_doc.sh generate
 
 .PHONY: protos
-protos: buildenv
-	@$(DRUN) hyperledger/fabric-buildenv:$(DOCKER_TAG) ./scripts/compile_protos.sh
+protos: gotool.protoc-gen-go
+	@echo "Compiling non-API protos..."
+	./scripts/compile_protos.sh
 
+.PHONY: native
+native: $(RELEASE_EXES)
+
+.PHONY: $(RELEASE_EXES)
+$(RELEASE_EXES): %: $(BUILD_DIR)/bin/%
+
+$(BUILD_DIR)/bin/%: GO_LDFLAGS = $(METADATA_VAR:%=-X $(PKGNAME)/common/metadata.%)
+$(BUILD_DIR)/bin/%:
+	@echo "Building $@"
+	@mkdir -p $(@D)
+	GOBIN=$(abspath $(@D)) go install -tags "$(GO_TAGS)" -ldflags "$(GO_LDFLAGS)" $(pkgmap.$(@F))
+	@touch $@
+
+.PHONY: docker
+docker: $(RELEASE_IMAGES:%=%-docker)
+
+.PHONY: $(RELEASE_IMAGES:%=%-docker)
+$(RELEASE_IMAGES:%=%-docker): %-docker: $(BUILD_DIR)/images/%/$(DUMMY)
+
+$(BUILD_DIR)/images/ccenv/$(DUMMY):   BUILD_CONTEXT=images/ccenv
+$(BUILD_DIR)/images/baseos/$(DUMMY):  BUILD_CONTEXT=images/baseos
+$(BUILD_DIR)/images/peer/$(DUMMY):    BUILD_ARGS=--build-arg GO_TAGS=${GO_TAGS}
+$(BUILD_DIR)/images/orderer/$(DUMMY): BUILD_ARGS=--build-arg GO_TAGS=${GO_TAGS}
+
+$(BUILD_DIR)/images/%/$(DUMMY):
+	@echo "Building Docker image $(DOCKER_NS)/fabric-$*"
+	@mkdir -p $(@D)
+	$(DBUILD) -f images/$*/Dockerfile \
+		--build-arg GO_VER=$(GO_VER) \
+		--build-arg ALPINE_VER=$(ALPINE_VER) \
+		$(BUILD_ARGS) \
+		-t $(DOCKER_NS)/fabric-$* ./$(BUILD_CONTEXT)
+	docker tag $(DOCKER_NS)/fabric-$* $(DOCKER_NS)/fabric-$*:$(BASE_VERSION)
+	docker tag $(DOCKER_NS)/fabric-$* $(DOCKER_NS)/fabric-$*:$(TWO_DIGIT_VERSION)
+	docker tag $(DOCKER_NS)/fabric-$* $(DOCKER_NS)/fabric-$*:$(DOCKER_TAG)
+	@touch $@
+
+# builds release packages for the host platform
+.PHONY: release
+release: check-go-version $(MARCH:%=release/%)
+
+# builds release packages for all target platforms
+.PHONY: release-all
+release-all: check-go-version $(RELEASE_PLATFORMS:%=release/%)
+
+.PHONY: $(RELEASE_PLATFORMS:%=release/%)
+$(RELEASE_PLATFORMS:%=release/%): GO_LDFLAGS = $(METADATA_VAR:%=-X $(PKGNAME)/common/metadata.%)
+$(RELEASE_PLATFORMS:%=release/%): release/%: $(foreach exe,$(RELEASE_EXES),release/%/bin/$(exe))
+
+# explicit targets for all platform executables
+$(foreach platform, $(RELEASE_PLATFORMS), $(RELEASE_EXES:%=release/$(platform)/bin/%)):
+	$(eval platform = $(patsubst release/%/bin,%,$(@D)))
+	$(eval GOOS = $(word 1,$(subst -, ,$(platform))))
+	$(eval GOARCH = $(word 2,$(subst -, ,$(platform))))
+	@echo "Building $@ for $(GOOS)-$(GOARCH)"
+	mkdir -p $(@D)
+	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -o $@ -tags "$(GO_TAGS)" -ldflags "$(GO_LDFLAGS)" $(pkgmap.$(@F))
+
+.PHONY: dist
+dist: dist-clean dist/$(MARCH)
+
+.PHONY: dist-all
+dist-all: dist-clean $(RELEASE_PLATFORMS:%=dist/%)
+dist/%: release/%
+	mkdir -p release/$(@F)/config
+	cp -r sampleconfig/*.yaml release/$(@F)/config
+	cd release/$(@F) && tar -czvf hyperledger-fabric-$(@F).$(PROJECT_VERSION).tar.gz *
+
+.PHONY: docker-list
+docker-list: $(RELEASE_IMAGES:%=%-docker-list)
+%-docker-list:
+	@echo $(DOCKER_NS)/fabric-$*:$(DOCKER_TAG)
+
+.PHONY: docker-clean
+docker-clean: $(RELEASE_IMAGES:%=%-docker-clean)
 %-docker-clean:
-	$(eval TARGET = ${patsubst %-docker-clean,%,${@}})
-	-docker images -q $(PROJECT_NAME)-$(TARGET) | xargs -I '{}' docker rmi -f '{}'
-	-@rm -rf build/image/$(TARGET) ||:
+	-@for image in "$$(docker images --quiet --filter=reference='$(DOCKER_NS)/fabric-$*:$(DOCKER_TAG)')"; do \
+		[ -z "$$image" ] || docker rmi -f $$image; \
+	done
+	-@rm -rf $(BUILD_DIR)/images/$* || true
 
-docker-clean: $(patsubst %,%-docker-clean, $(IMAGES))
+.PHONY: docker-tag-latest
+docker-tag-latest: $(RELEASE_IMAGES:%=%-docker-tag-latest)
+%-docker-tag-latest:
+	docker tag $(DOCKER_NS)/fabric-$*:$(DOCKER_TAG) $(DOCKER_NS)/fabric-$*:latest
+
+.PHONY: docker-tag-stable
+docker-tag-stable: $(RELEASE_IMAGES:%=%-docker-tag-stable)
+%-docker-tag-stable:
+	docker tag $(DOCKER_NS)/fabric-$*:$(DOCKER_TAG) $(DOCKER_NS)/fabric-$*:stable
+
+.PHONY: publish-images
+publish-images: $(RELEASE_IMAGES:%=%-publish-images)
+%-publish-images:
+	@docker login $(DOCKER_HUB_USERNAME) $(DOCKER_HUB_PASSWORD)
+	@docker push $(DOCKER_NS)/fabric-$*:$(PROJECT_VERSION)
 
 .PHONY: clean
-clean: docker-clean
-	-@rm -rf build ||:
+clean: docker-clean unit-test-clean release-clean
+	-@rm -rf $(BUILD_DIR)
+
+.PHONY: clean-all
+clean-all: clean gotools-clean dist-clean
+	-@rm -rf /var/hyperledger/*
+	-@rm -rf docs/build/
 
 .PHONY: dist-clean
-dist-clean: clean gotools-clean
-	-@rm -rf /var/hyperledger/* ||:
+dist-clean:
+	-@for platform in $(RELEASE_PLATFORMS) ""; do \
+		[ -z "$$platform" ] || rm -rf release/$${platform}/hyperledger-fabric-$${platform}.$(PROJECT_VERSION).tar.gz; \
+	done
+
+.PHONY: release-clean
+release-clean: $(RELEASE_PLATFORMS:%=%-release-clean)
+%-release-clean:
+	-@rm -rf release/$*
+
+.PHONY: unit-test-clean
+unit-test-clean:
+
+.PHONY: filename-spaces
+spaces:
+	@scripts/check_file_name_spaces.sh

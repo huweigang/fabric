@@ -16,7 +16,7 @@ limitations under the License.
 
 package kvledger
 
-import "github.com/hyperledger/fabric/protos/common"
+import "github.com/hyperledger/fabric/core/ledger"
 
 type recoverable interface {
 	// ShouldRecover return whether recovery is need.
@@ -24,7 +24,9 @@ type recoverable interface {
 	// lastAvailableBlock is the max block number that has been committed to the block storage
 	ShouldRecover(lastAvailableBlock uint64) (bool, uint64, error)
 	// CommitLostBlock recommits the block
-	CommitLostBlock(block *common.Block) error
+	CommitLostBlock(block *ledger.BlockAndPvtData) error
+	// Name returns the name of the database: either state or history
+	Name() string
 }
 
 type recoverer struct {

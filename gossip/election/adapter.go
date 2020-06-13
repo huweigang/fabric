@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package election
@@ -21,11 +11,12 @@ import (
 	"sync"
 	"time"
 
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
 	"github.com/hyperledger/fabric/gossip/common"
 	"github.com/hyperledger/fabric/gossip/discovery"
+	"github.com/hyperledger/fabric/gossip/metrics"
+	"github.com/hyperledger/fabric/gossip/protoext"
 	"github.com/hyperledger/fabric/gossip/util"
-	proto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/op/go-logging"
 )
 
 type msgImpl struct {
@@ -33,7 +24,7 @@ type msgImpl struct {
 }
 
 func (mi *msgImpl) SenderID() peerID {
-	return mi.msg.GetLeadershipMsg().PkiID
+	return mi.msg.GetLeadershipMsg().PkiId
 }
 
 func (mi *msgImpl) IsProposal() bool {
@@ -53,17 +44,20 @@ func (pi *peerImpl) ID() peerID {
 }
 
 type gossip interface {
-	// Peers returns the NetworkMembers considered alive
-	Peers() []discovery.NetworkMember
+	// PeersOfChannel returns the NetworkMembers considered alive in a channel
+	PeersOfChannel(channel common.ChannelID) []discovery.NetworkMember
 
 	// Accept returns a dedicated read-only channel for messages sent by other nodes that match a certain predicate.
 	// If passThrough is false, the messages are processed by the gossip layer beforehand.
 	// If passThrough is true, the gossip layer doesn't intervene and the messages
 	// can be used to send a reply back to the sender
-	Accept(acceptor common.MessageAcceptor, passThrough bool) (<-chan *proto.GossipMessage, <-chan proto.ReceivedMessage)
+	Accept(acceptor common.MessageAcceptor, passThrough bool) (<-chan *proto.GossipMessage, <-chan protoext.ReceivedMessage)
 
 	// Gossip sends a message to other peers to the network
 	Gossip(msg *proto.GossipMessage)
+
+	// IsInMyOrg checks whether a network member is in this peer's org
+	IsInMyOrg(member discovery.NetworkMember) bool
 }
 
 type adapterImpl struct {
@@ -73,16 +67,18 @@ type adapterImpl struct {
 	incTime uint64
 	seqNum  uint64
 
-	channel common.ChainID
+	channel common.ChannelID
 
-	logger *logging.Logger
+	logger util.Logger
 
 	doneCh   chan struct{}
 	stopOnce *sync.Once
+	metrics  *metrics.ElectionMetrics
 }
 
 // NewAdapter creates new leader election adapter
-func NewAdapter(gossip gossip, pkiid common.PKIidType, channel common.ChainID) LeaderElectionAdapter {
+func NewAdapter(gossip gossip, pkiid common.PKIidType, channel common.ChannelID,
+	metrics *metrics.ElectionMetrics) LeaderElectionAdapter {
 	return &adapterImpl{
 		gossip:    gossip,
 		selfPKIid: pkiid,
@@ -92,10 +88,11 @@ func NewAdapter(gossip gossip, pkiid common.PKIidType, channel common.ChainID) L
 
 		channel: channel,
 
-		logger: util.GetLogger(util.LoggingElectionModule, ""),
+		logger: util.GetLogger(util.ElectionLogger, ""),
 
 		doneCh:   make(chan struct{}),
 		stopOnce: &sync.Once{},
+		metrics:  metrics,
 	}
 }
 
@@ -107,7 +104,7 @@ func (ai *adapterImpl) Accept() <-chan Msg {
 	adapterCh, _ := ai.gossip.Accept(func(message interface{}) bool {
 		// Get only leadership org and channel messages
 		return message.(*proto.GossipMessage).Tag == proto.GossipMessage_CHAN_AND_ORG &&
-			message.(*proto.GossipMessage).IsLeadershipMsg() &&
+			protoext.IsLeadershipMsg(message.(*proto.GossipMessage)) &&
 			bytes.Equal(message.(*proto.GossipMessage).Channel, ai.channel)
 	}, false)
 
@@ -135,11 +132,11 @@ func (ai *adapterImpl) CreateMessage(isDeclaration bool) Msg {
 	seqNum := ai.seqNum
 
 	leadershipMsg := &proto.LeadershipMessage{
-		PkiID:         ai.selfPKIid,
+		PkiId:         ai.selfPKIid,
 		IsDeclaration: isDeclaration,
 		Timestamp: &proto.PeerTime{
-			IncNumber: ai.incTime,
-			SeqNum:    seqNum,
+			IncNum: ai.incTime,
+			SeqNum: seqNum,
 		},
 	}
 
@@ -153,14 +150,24 @@ func (ai *adapterImpl) CreateMessage(isDeclaration bool) Msg {
 }
 
 func (ai *adapterImpl) Peers() []Peer {
-	peers := ai.gossip.Peers()
+	peers := ai.gossip.PeersOfChannel(ai.channel)
 
 	var res []Peer
 	for _, peer := range peers {
-		res = append(res, &peerImpl{peer})
+		if ai.gossip.IsInMyOrg(peer) {
+			res = append(res, &peerImpl{peer})
+		}
 	}
 
 	return res
+}
+
+func (ai *adapterImpl) ReportMetrics(isLeader bool) {
+	var leadershipBit float64
+	if isLeader {
+		leadershipBit = 1
+	}
+	ai.metrics.Declaration.With("channel", string(ai.channel)).Set(leadershipBit)
 }
 
 func (ai *adapterImpl) Stop() {

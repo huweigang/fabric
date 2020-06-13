@@ -1,38 +1,19 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package election
 
 import (
 	"bytes"
-	"fmt"
+	"encoding/hex"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/hyperledger/fabric/gossip/util"
-	"github.com/op/go-logging"
-)
-
-var (
-	startupGracePeriod            = time.Second * 15
-	membershipSampleInterval      = time.Second
-	leaderAliveThreshold          = time.Second * 10
-	leadershipDeclarationInterval = leaderAliveThreshold / 2
-	leaderElectionDuration        = time.Second * 5
 )
 
 // Gossip leader election module
@@ -89,7 +70,6 @@ var (
 // LeaderElectionAdapter is used by the leader election module
 // to send and receive messages and to get membership information
 type LeaderElectionAdapter interface {
-
 	// Gossip gossips a message to other peers
 	Gossip(Msg)
 
@@ -101,6 +81,9 @@ type LeaderElectionAdapter interface {
 
 	// Peers returns a list of peers considered alive
 	Peers() []Peer
+
+	// ReportMetrics sends a report to the metrics server about a leadership status
+	ReportMetrics(isLeader bool)
 }
 
 type leadershipCallback func(isLeader bool)
@@ -112,9 +95,20 @@ type LeaderElectionService interface {
 
 	// Stop stops the LeaderElectionService
 	Stop()
+
+	// Yield relinquishes the leadership until a new leader is elected,
+	// or a timeout expires
+	Yield()
 }
 
 type peerID []byte
+
+func (p peerID) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	return hex.EncodeToString(p)
+}
 
 // Peer describes a remote peer
 type Peer interface {
@@ -135,19 +129,34 @@ type Msg interface {
 func noopCallback(_ bool) {
 }
 
+const (
+	DefStartupGracePeriod       = time.Second * 15
+	DefMembershipSampleInterval = time.Second
+	DefLeaderAliveThreshold     = time.Second * 10
+	DefLeaderElectionDuration   = time.Second * 5
+)
+
+type ElectionConfig struct {
+	StartupGracePeriod       time.Duration
+	MembershipSampleInterval time.Duration
+	LeaderAliveThreshold     time.Duration
+	LeaderElectionDuration   time.Duration
+}
+
 // NewLeaderElectionService returns a new LeaderElectionService
-func NewLeaderElectionService(adapter LeaderElectionAdapter, id string, callback leadershipCallback) LeaderElectionService {
+func NewLeaderElectionService(adapter LeaderElectionAdapter, id string, callback leadershipCallback, config ElectionConfig) LeaderElectionService {
 	if len(id) == 0 {
-		panic(fmt.Errorf("Empty id"))
+		panic("Empty id")
 	}
 	le := &leaderElectionSvcImpl{
 		id:            peerID(id),
 		proposals:     util.NewSet(),
 		adapter:       adapter,
-		stopChan:      make(chan struct{}, 1),
+		stopChan:      make(chan struct{}),
 		interruptChan: make(chan struct{}, 1),
-		logger:        util.GetLogger(util.LoggingElectionModule, ""),
+		logger:        util.GetLogger(util.ElectionLogger, ""),
 		callback:      noopCallback,
+		config:        config,
 	}
 
 	if callback != nil {
@@ -167,18 +176,20 @@ type leaderElectionSvcImpl struct {
 	interruptChan chan struct{}
 	stopWG        sync.WaitGroup
 	isLeader      int32
-	toDie         int32
 	leaderExists  int32
+	yield         int32
 	sleeping      bool
 	adapter       LeaderElectionAdapter
-	logger        *logging.Logger
+	logger        util.Logger
 	callback      leadershipCallback
+	yieldTimer    *time.Timer
+	config        ElectionConfig
 }
 
 func (le *leaderElectionSvcImpl) start() {
 	le.stopWG.Add(2)
 	go le.handleMessages()
-	le.waitForMembershipStabilization(startupGracePeriod)
+	le.waitForMembershipStabilization(le.config.StartupGracePeriod)
 	go le.run()
 }
 
@@ -190,7 +201,6 @@ func (le *leaderElectionSvcImpl) handleMessages() {
 	for {
 		select {
 		case <-le.stopChan:
-			le.stopChan <- struct{}{}
 			return
 		case msg := <-msgChan:
 			if !le.isAlive(msg.SenderID()) {
@@ -239,7 +249,6 @@ func (le *leaderElectionSvcImpl) waitForInterrupt(timeout time.Duration) {
 	select {
 	case <-le.interruptChan:
 	case <-le.stopChan:
-		le.stopChan <- struct{}{}
 	case <-time.After(timeout):
 	}
 
@@ -258,6 +267,11 @@ func (le *leaderElectionSvcImpl) run() {
 		if !le.isLeaderExists() {
 			le.leaderElection()
 		}
+		// If we are yielding and some leader has been elected,
+		// stop yielding
+		if le.isLeaderExists() && le.isYielding() {
+			le.stopYielding()
+		}
 		if le.shouldStop() {
 			return
 		}
@@ -272,12 +286,24 @@ func (le *leaderElectionSvcImpl) run() {
 func (le *leaderElectionSvcImpl) leaderElection() {
 	le.logger.Debug(le.id, ": Entering")
 	defer le.logger.Debug(le.id, ": Exiting")
+	// If we're yielding to other peers, do not participate
+	// in leader election
+	if le.isYielding() {
+		return
+	}
+	// Propose ourselves as a leader
 	le.propose()
-	le.waitForInterrupt(leaderElectionDuration)
+	// Collect other proposals
+	le.waitForInterrupt(le.config.LeaderElectionDuration)
 	// If someone declared itself as a leader, give up
 	// on trying to become a leader too
 	if le.isLeaderExists() {
-		le.logger.Debug(le.id, ": Some peer is already a leader")
+		le.logger.Info(le.id, ": Some peer is already a leader")
+		return
+	}
+
+	if le.isYielding() {
+		le.logger.Debug(le.id, ": Aborting leader election because yielding")
 		return
 	}
 	// Leader doesn't exist, let's see if there is a better candidate than us
@@ -308,17 +334,18 @@ func (le *leaderElectionSvcImpl) follower() {
 
 	le.proposals.Clear()
 	atomic.StoreInt32(&le.leaderExists, int32(0))
+	le.adapter.ReportMetrics(false)
 	select {
-	case <-time.After(leaderAliveThreshold):
+	case <-time.After(le.config.LeaderAliveThreshold):
 	case <-le.stopChan:
-		le.stopChan <- struct{}{}
 	}
 }
 
 func (le *leaderElectionSvcImpl) leader() {
 	leaderDeclaration := le.adapter.CreateMessage(true)
 	le.adapter.Gossip(leaderDeclaration)
-	le.waitForInterrupt(leadershipDeclarationInterval)
+	le.adapter.ReportMetrics(true)
+	le.waitForInterrupt(le.config.LeaderAliveThreshold / 2)
 }
 
 // waitForMembershipStabilization waits for membership view to stabilize
@@ -329,7 +356,7 @@ func (le *leaderElectionSvcImpl) waitForMembershipStabilization(timeLimit time.D
 	endTime := time.Now().Add(timeLimit)
 	viewSize := len(le.adapter.Peers())
 	for !le.shouldStop() {
-		time.Sleep(membershipSampleInterval)
+		time.Sleep(le.config.MembershipSampleInterval)
 		newSize := len(le.adapter.Peers())
 		if newSize == viewSize || time.Now().After(endTime) || le.isLeaderExists() {
 			return
@@ -368,26 +395,66 @@ func (le *leaderElectionSvcImpl) IsLeader() bool {
 }
 
 func (le *leaderElectionSvcImpl) beLeader() {
-	le.logger.Debug(le.id, ": Becoming a leader")
+	le.logger.Info(le.id, ": Becoming a leader")
 	atomic.StoreInt32(&le.isLeader, int32(1))
 	le.callback(true)
 }
 
 func (le *leaderElectionSvcImpl) stopBeingLeader() {
-	le.logger.Debug(le.id, "Stopped being a leader")
+	le.logger.Info(le.id, "Stopped being a leader")
 	atomic.StoreInt32(&le.isLeader, int32(0))
 	le.callback(false)
 }
 
 func (le *leaderElectionSvcImpl) shouldStop() bool {
-	return atomic.LoadInt32(&le.toDie) == int32(1)
+	select {
+	case <-le.stopChan:
+		return true
+	default:
+		return false
+	}
+}
+
+func (le *leaderElectionSvcImpl) isYielding() bool {
+	return atomic.LoadInt32(&le.yield) == int32(1)
+}
+
+func (le *leaderElectionSvcImpl) stopYielding() {
+	le.logger.Debug("Stopped yielding")
+	le.Lock()
+	defer le.Unlock()
+	atomic.StoreInt32(&le.yield, int32(0))
+	le.yieldTimer.Stop()
+}
+
+// Yield relinquishes the leadership until a new leader is elected,
+// or a timeout expires
+func (le *leaderElectionSvcImpl) Yield() {
+	le.Lock()
+	defer le.Unlock()
+	if !le.IsLeader() || le.isYielding() {
+		return
+	}
+	// Turn on the yield flag
+	atomic.StoreInt32(&le.yield, int32(1))
+	// Stop being a leader
+	le.stopBeingLeader()
+	// Clear the leader exists flag since it could be that we are the leader
+	atomic.StoreInt32(&le.leaderExists, int32(0))
+	// Clear the yield flag in any case afterwards
+	le.yieldTimer = time.AfterFunc(le.config.LeaderAliveThreshold*6, func() {
+		atomic.StoreInt32(&le.yield, int32(0))
+	})
 }
 
 // Stop stops the LeaderElectionService
 func (le *leaderElectionSvcImpl) Stop() {
-	le.logger.Debug(le.id, ": Entering")
-	defer le.logger.Debug(le.id, ": Exiting")
-	atomic.StoreInt32(&le.toDie, int32(1))
-	le.stopChan <- struct{}{}
-	le.stopWG.Wait()
+	select {
+	case <-le.stopChan:
+	default:
+		close(le.stopChan)
+		le.logger.Debug(le.id, ": Entering")
+		defer le.logger.Debug(le.id, ": Exiting")
+		le.stopWG.Wait()
+	}
 }

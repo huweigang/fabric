@@ -1,173 +1,107 @@
+/*
+Copyright IBM Corp. All Rights Reserved.
+
+SPDX-License-Identifier: Apache-2.0
+*/
+
 package util
 
 import (
+	"archive/tar"
 	"bytes"
-	"encoding/hex"
-	"math/rand"
+	"fmt"
+	"io"
+	"os"
+	"runtime"
+	"strings"
 	"testing"
-	"time"
 
-	"github.com/hyperledger/fabric/common/util"
+	docker "github.com/fsouza/go-dockerclient"
+	"github.com/hyperledger/fabric/common/metadata"
+	"github.com/hyperledger/fabric/core/config/configtest"
+	"github.com/spf13/viper"
+	"github.com/stretchr/testify/assert"
 )
 
-// TestHashContentChange changes a random byte in a content and checks for hash change
-func TestHashContentChange(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
+func TestDockerPull(t *testing.T) {
+	codepackage, output := io.Pipe()
+	go func() {
+		tw := tar.NewWriter(output)
 
-	b2 := []byte("To be, or not to be- that is the question: Whether 'tis nobler in the mind to suffer The slings and arrows of outrageous fortune Or to take arms against a sea of troubles, And by opposing end them. To die- to sleep- No more; and by a sleep to say we end The heartache, and the thousand natural shocks That flesh is heir to. 'Tis a consummation Devoutly to be wish'd.")
+		tw.Close()
+		output.Close()
+	}()
 
-	h1 := ComputeHash(b2, hash)
+	binpackage := bytes.NewBuffer(nil)
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	randIndex := (int(r.Uint32())) % len(b2)
-
-	randByte := byte((int(r.Uint32())) % 128)
-
-	//make sure the two bytes are different
-	for {
-		if randByte != b2[randIndex] {
-			break
-		}
-
-		randByte = byte((int(r.Uint32())) % 128)
+	// Perform a nop operation within a fixed target.  We choose 1.1.0 because we know it's
+	// published and available.  Ideally we could choose something that we know is both multi-arch
+	// and ok to delete prior to executing DockerBuild.  This would ensure that we exercise the
+	// image pull logic.  However, no suitable target exists that meets all the criteria.  Therefore
+	// we settle on using a known released image.  We don't know if the image is already
+	// downloaded per se, and we don't want to explicitly delete this particular image first since
+	// it could be in use legitimately elsewhere.  Instead, we just know that this should always
+	// work and call that "close enough".
+	//
+	// Future considerations: publish a known dummy image that is multi-arch and free to randomly
+	// delete, and use that here instead.
+	image := fmt.Sprintf("hyperledger/fabric-ccenv:%s-1.1.0", runtime.GOARCH)
+	client, err := docker.NewClientFromEnv()
+	if err != nil {
+		t.Errorf("failed to get docker client: %s", err)
 	}
 
-	//change a random byte
-	b2[randIndex] = randByte
-
-	//this is the core hash func under test
-	h2 := ComputeHash(b2, hash)
-
-	//the two hashes should be different
-	if bytes.Compare(h1, h2) == 0 {
-		t.Error("Hash expected to be different but is same")
+	err = DockerBuild(
+		DockerBuildOptions{
+			Image:        image,
+			Cmd:          "/bin/true",
+			InputStream:  codepackage,
+			OutputStream: binpackage,
+		},
+		client,
+	)
+	if err != nil {
+		t.Errorf("Error during build: %s", err)
 	}
 }
 
-// TestHashLenChange changes a random length of a content and checks for hash change
-func TestHashLenChange(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
+func TestUtil_GetDockerImageFromConfig(t *testing.T) {
 
-	b2 := []byte("To be, or not to be-")
+	path := "dt"
 
-	h1 := ComputeHash(b2, hash)
+	expected := "FROM " + metadata.DockerNamespace + ":" + runtime.GOARCH + "-" + metadata.Version
+	viper.Set(path, "FROM $(DOCKER_NS):$(ARCH)-$(PROJECT_VERSION)")
+	actual := GetDockerImageFromConfig(path)
+	assert.Equal(t, expected, actual, `Error parsing Dockerfile Template. Expected "%s", got "%s"`, expected, actual)
 
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	randIndex := (int(r.Uint32())) % len(b2)
-
-	b2 = b2[0:randIndex]
-
-	h2 := ComputeHash(b2, hash)
-
-	//hash should be different
-	if bytes.Compare(h1, h2) == 0 {
-		t.Error("Hash expected to be different but is same")
-	}
-}
-
-// TestHashOrderChange changes a order of hash computation over a list of lines and checks for hash change
-func TestHashOrderChange(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
-
-	b2 := [][]byte{[]byte("To be, or not to be- that is the question:"),
-		[]byte("Whether 'tis nobler in the mind to suffer"),
-		[]byte("The slings and arrows of outrageous fortune"),
-		[]byte("Or to take arms against a sea of troubles,"),
-		[]byte("And by opposing end them."),
-		[]byte("To die- to sleep- No more; and by a sleep to say we end"),
-		[]byte("The heartache, and the thousand natural shocks"),
-		[]byte("That flesh is heir to."),
-		[]byte("'Tis a consummation Devoutly to be wish'd.")}
-	h1 := hash
-
-	for _, l := range b2 {
-		h1 = ComputeHash(l, h1)
-	}
-
-	r := rand.New(rand.NewSource(time.Now().UnixNano()))
-	randIndex1 := (int(r.Uint32())) % len(b2)
-	randIndex2 := (int(r.Uint32())) % len(b2)
-
-	//make sure the two indeces are different
-	for {
-		if randIndex2 != randIndex1 {
-			break
-		}
-
-		randIndex2 = (int(r.Uint32())) % len(b2)
-	}
-
-	//switch two arbitrary lines
-	tmp := b2[randIndex2]
-	b2[randIndex2] = b2[randIndex1]
-	b2[randIndex1] = tmp
-
-	h2 := hash
-	for _, l := range b2 {
-		h2 = ComputeHash(l, hash)
-	}
-
-	//hash should be different
-	if bytes.Compare(h1, h2) == 0 {
-		t.Error("Hash expected to be different but is same")
-	}
-}
-
-// TestHashOverFiles computes hash over a directory and ensures it matches precomputed, hardcoded, hash
-func TestHashOverFiles(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
-
-	hash, err := HashFilesInDir(".", "hashtestfiles1", hash, nil)
-
-	if err != nil {
-		t.Fail()
-		t.Logf("error : %s", err)
-	}
-
-	//as long as no files under "hashtestfiles1" are changed, hash should always compute to the following
-	expectedHash := "0c92180028200dfabd08d606419737f5cdecfcbab403e3f0d79e8d949f4775bc"
-
-	computedHash := hex.EncodeToString(hash[:])
-
-	if expectedHash != computedHash {
-		t.Error("Hash expected to be unchanged")
-	}
-}
-
-func TestHashDiffDir(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
-
-	hash1, err := HashFilesInDir(".", "hashtestfiles1", hash, nil)
-	if err != nil {
-		t.Errorf("Error getting code %s", err)
-	}
-	hash2, err := HashFilesInDir(".", "hashtestfiles2", hash, nil)
-	if err != nil {
-		t.Errorf("Error getting code %s", err)
-	}
-	if bytes.Compare(hash1, hash2) == 0 {
-		t.Error("Hash should be different for 2 different remote repos")
-	}
+	expected = "FROM " + metadata.DockerNamespace + ":" + runtime.GOARCH + "-" + twoDigitVersion(metadata.Version)
+	viper.Set(path, "FROM $(DOCKER_NS):$(ARCH)-$(TWO_DIGIT_VERSION)")
+	actual = GetDockerImageFromConfig(path)
+	assert.Equal(t, expected, actual, `Error parsing Dockerfile Template. Expected "%s", got "%s"`, expected, actual)
 
 }
-func TestHashSameDir(t *testing.T) {
-	b := []byte("firstcontent")
-	hash := util.ComputeSHA256(b)
 
-	hash1, err := HashFilesInDir(".", "hashtestfiles1", hash, nil)
-	if err != nil {
-		t.Errorf("Error getting code %s", err)
+func TestMain(m *testing.M) {
+	viper.SetConfigName("core")
+	viper.SetEnvPrefix("CORE")
+	configtest.AddDevConfigPath(nil)
+	viper.SetEnvKeyReplacer(strings.NewReplacer(".", "_"))
+	viper.AutomaticEnv()
+	if err := viper.ReadInConfig(); err != nil {
+		fmt.Printf("could not read config %s\n", err)
+		os.Exit(-1)
 	}
-	hash2, err := HashFilesInDir(".", "hashtestfiles1", hash, nil)
-	if err != nil {
-		t.Errorf("Error getting code %s", err)
-	}
-	if bytes.Compare(hash1, hash2) != 0 {
-		t.Error("Hash should be same across multiple downloads")
-	}
+	os.Exit(m.Run())
+}
+
+func TestTwoDigitVersion(t *testing.T) {
+	version := "2.0.0"
+	expected := "2.0"
+	actual := twoDigitVersion(version)
+	assert.Equal(t, expected, actual, `Error parsing two digit version. Expected "%s", got "%s"`, expected, actual)
+
+	version = "latest"
+	expected = "latest"
+	actual = twoDigitVersion(version)
+	assert.Equal(t, expected, actual, `Error parsing two digit version. Expected "%s", got "%s"`, expected, actual)
 }

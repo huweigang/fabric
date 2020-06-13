@@ -1,18 +1,5 @@
-/*
-Copyright IBM Corp. 2016 All Rights Reserved.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-*/
+// Copyright IBM Corp. All Rights Reserved.
+// SPDX-License-Identifier: Apache-2.0
 
 package main
 
@@ -20,17 +7,15 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"os"
 
+	cb "github.com/hyperledger/fabric-protos-go/common"
+	ab "github.com/hyperledger/fabric-protos-go/orderer"
+	"github.com/hyperledger/fabric/bccsp/factory"
+	mspmgmt "github.com/hyperledger/fabric/msp/mgmt"
+	"github.com/hyperledger/fabric/orderer/common/localconfig"
 	"google.golang.org/grpc"
-
-	genesisconfig "github.com/hyperledger/fabric/common/configtx/tool/localconfig"
-	"github.com/hyperledger/fabric/orderer/localconfig"
-	cb "github.com/hyperledger/fabric/protos/common"
-	ab "github.com/hyperledger/fabric/protos/orderer"
 )
-
-var conf *config.TopLevel
-var genConf *genesisconfig.Profile
 
 type broadcastClient struct {
 	ab.AtomicBroadcast_BroadcastClient
@@ -67,9 +52,21 @@ type argsImpl struct {
 	chainID        string
 }
 
+var conf *localconfig.TopLevel
+
 func init() {
-	conf = config.Load()
-	genConf = genesisconfig.Load(genesisconfig.SampleInsecureProfile)
+	var err error
+	conf, err = localconfig.Load()
+	if err != nil {
+		fmt.Println("failed to load config:", err)
+		os.Exit(1)
+	}
+
+	// Load local MSP
+	err = mspmgmt.LoadLocalMsp(conf.General.LocalMSPDir, conf.General.BCCSP, conf.General.LocalMSPID)
+	if err != nil {
+		panic(fmt.Errorf("failed to initialize local MSP: %s", err))
+	}
 }
 
 func main() {
@@ -78,10 +75,16 @@ func main() {
 
 	flag.StringVar(&srv, "server", fmt.Sprintf("%s:%d", conf.General.ListenAddress, conf.General.ListenPort), "The RPC server to connect to.")
 	flag.StringVar(&cmd.name, "cmd", "newChain", "The action that this client is requesting via the config transaction.")
-	flag.StringVar(&cmd.args.consensusType, "consensusType", genConf.Orderer.OrdererType, "In case of a newChain command, the type of consensus the ordering service is running on.")
+	flag.StringVar(&cmd.args.consensusType, "consensusType", "solo", "In case of a newChain command, the type of consensus the ordering service is running on.")
 	flag.StringVar(&cmd.args.creationPolicy, "creationPolicy", "AcceptAllPolicy", "In case of a newChain command, the chain creation policy this request should be validated against.")
-	flag.StringVar(&cmd.args.chainID, "chainID", "NewChannelId", "In case of a newChain command, the chain ID to create.")
+	flag.StringVar(&cmd.args.chainID, "chainID", "mychannel", "In case of a newChain command, the chain ID to create.")
 	flag.Parse()
+
+	signer, err := mspmgmt.GetLocalMSP(factory.GetDefault()).GetDefaultSigningIdentity()
+	if err != nil {
+		fmt.Println("Failed to load local signing identity:", err)
+		os.Exit(0)
+	}
 
 	conn, err := grpc.Dial(srv, grpc.WithInsecure())
 	defer func() {
@@ -102,7 +105,12 @@ func main() {
 
 	switch cmd.name {
 	case "newChain":
-		env := newChainRequest(cmd.args.consensusType, cmd.args.creationPolicy, cmd.args.chainID)
+		env := newChainRequest(
+			cmd.args.consensusType,
+			cmd.args.creationPolicy,
+			cmd.args.chainID,
+			signer,
+		)
 		fmt.Println("Requesting the creation of chain", cmd.args.chainID)
 		fmt.Println(bc.broadcast(env))
 	default:

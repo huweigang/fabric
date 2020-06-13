@@ -1,17 +1,7 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package util
@@ -27,14 +17,26 @@ import (
 	"github.com/spf13/viper"
 )
 
+func init() { // do we really need this?
+	rand.Seed(time.Now().UnixNano())
+}
+
 // Equals returns whether a and b are the same
 type Equals func(a interface{}, b interface{}) bool
 
-func init() {
-	rand.Seed(42)
+var viperLock sync.RWMutex
+
+// Contains returns whether a given slice a contains a string s
+func Contains(s string, a []string) bool {
+	for _, e := range a {
+		if e == s {
+			return true
+		}
+	}
+	return false
 }
 
-// IndexInSlice returns the index of given object o in array
+// IndexInSlice returns the index of given object o in array, and -1 if it is not in array.
 func IndexInSlice(array interface{}, o interface{}, equals Equals) int {
 	arr := reflect.ValueOf(array)
 	for i := 0; i < arr.Len(); i++ {
@@ -45,33 +47,15 @@ func IndexInSlice(array interface{}, o interface{}, equals Equals) int {
 	return -1
 }
 
-func numbericEqual(a interface{}, b interface{}) bool {
-	return a.(int) == b.(int)
-}
-
-// GetRandomIndices returns a slice of random indices
-// from 0 to given highestIndex
+// GetRandomIndices returns indiceCount random indices
+// from 0 to highestIndex.
 func GetRandomIndices(indiceCount, highestIndex int) []int {
+	// More choices needed than possible to choose.
 	if highestIndex+1 < indiceCount {
 		return nil
 	}
 
-	indices := make([]int, 0)
-	if highestIndex+1 == indiceCount {
-		for i := 0; i < indiceCount; i++ {
-			indices = append(indices, i)
-		}
-		return indices
-	}
-
-	for len(indices) < indiceCount {
-		n := rand.Intn(highestIndex + 1)
-		if IndexInSlice(indices, n, numbericEqual) != -1 {
-			continue
-		}
-		indices = append(indices, n)
-	}
-	return indices
+	return rand.Perm(highestIndex + 1)[:indiceCount]
 }
 
 // Set is a generic and thread-safe
@@ -99,6 +83,13 @@ func (s *Set) Exists(item interface{}) bool {
 	defer s.lock.RUnlock()
 	_, exists := s.items[item]
 	return exists
+}
+
+// Size returns the size of the set
+func (s *Set) Size() int {
+	s.lock.RLock()
+	defer s.lock.RUnlock()
+	return len(s.items)
 }
 
 // ToArray returns a slice with items
@@ -129,21 +120,19 @@ func (s *Set) Remove(item interface{}) {
 	delete(s.items, item)
 }
 
-type goroutine struct {
-	id    int64
-	Stack []string
-}
-
 // PrintStackTrace prints to stdout
 // all goroutines
 func PrintStackTrace() {
 	buf := make([]byte, 1<<16)
-	runtime.Stack(buf, true)
-	fmt.Printf("%s", buf)
+	l := runtime.Stack(buf, true)
+	fmt.Printf("%s", buf[:l])
 }
 
 // GetIntOrDefault returns the int value from config if present otherwise default value
 func GetIntOrDefault(key string, defVal int) int {
+	viperLock.RLock()
+	defer viperLock.RUnlock()
+
 	if val := viper.GetInt(key); val != 0 {
 		return val
 	}
@@ -151,11 +140,63 @@ func GetIntOrDefault(key string, defVal int) int {
 	return defVal
 }
 
-// GetIntOrDefault returns the Duration value from config if present otherwise default value
+// GetFloat64OrDefault returns the float64 value from config if present otherwise default value
+func GetFloat64OrDefault(key string, defVal float64) float64 {
+	viperLock.RLock()
+	defer viperLock.RUnlock()
+
+	if val := viper.GetFloat64(key); val != 0 {
+		return val
+	}
+
+	return defVal
+}
+
+// GetDurationOrDefault returns the Duration value from config if present otherwise default value
 func GetDurationOrDefault(key string, defVal time.Duration) time.Duration {
+	viperLock.RLock()
+	defer viperLock.RUnlock()
+
 	if val := viper.GetDuration(key); val != 0 {
 		return val
 	}
 
 	return defVal
+}
+
+// SetVal stores key value to viper
+func SetVal(key string, val interface{}) {
+	viperLock.Lock()
+	defer viperLock.Unlock()
+	viper.Set(key, val)
+}
+
+// RandomInt returns, as an int, a non-negative pseudo-random integer in [0,n)
+// It panics if n <= 0
+func RandomInt(n int) int {
+	return rand.Intn(n)
+}
+
+// RandomUInt64 returns a random uint64
+//
+// If we want a rand that's non-global and specific to gossip, we can
+// establish one. Otherwise this uses the process-global locking RNG.
+func RandomUInt64() uint64 {
+	return rand.Uint64()
+}
+
+func BytesToStrings(bytes [][]byte) []string {
+	strings := make([]string, len(bytes))
+	for i, b := range bytes {
+		strings[i] = string(b)
+	}
+	return strings
+}
+
+func StringsToBytes(strings []string) [][]byte {
+	bytes := make([][]byte, len(strings))
+	for i, str := range strings {
+		bytes[i] = []byte(str)
+	}
+	return bytes
 }

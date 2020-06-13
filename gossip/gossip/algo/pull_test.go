@@ -1,37 +1,25 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package algo
 
 import (
+	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
-
-	"fmt"
-	"sync/atomic"
 
 	"github.com/hyperledger/fabric/gossip/util"
 	"github.com/stretchr/testify/assert"
 )
 
 func init() {
-	SetDigestWaitTime(time.Duration(100) * time.Millisecond)
-	SetRequestWaitTime(time.Duration(200) * time.Millisecond)
-	SetResponseWaitTime(time.Duration(200) * time.Millisecond)
+	util.SetupTestLogging()
 }
 
 type messageHook func(interface{})
@@ -79,7 +67,13 @@ func newPushPullTestInstance(name string, peers map[string]*pullTestInstance) *p
 		name:              name,
 	}
 
-	inst.PullEngine = NewPullEngine(inst, time.Duration(500)*time.Millisecond)
+	config := PullEngineConfig{
+		DigestWaitTime:   time.Duration(100) * time.Millisecond,
+		RequestWaitTime:  time.Duration(200) * time.Millisecond,
+		ResponseWaitTime: time.Duration(200) * time.Millisecond,
+	}
+
+	inst.PullEngine = NewPullEngine(inst, time.Duration(500)*time.Millisecond, config)
 
 	peers[name] = inst
 	go func() {
@@ -89,7 +83,6 @@ func newPushPullTestInstance(name string, peers map[string]*pullTestInstance) *p
 				return
 			case m := <-inst.msgQueue:
 				inst.handleMessage(m)
-				break
 			}
 		}
 	}()
@@ -166,7 +159,6 @@ func (p *pullTestInstance) SendRes(items []string, context interface{}, nonce ui
 }
 
 func TestPullEngine_Add(t *testing.T) {
-	t.Parallel()
 	peers := make(map[string]*pullTestInstance)
 	inst1 := newPushPullTestInstance("p1", peers)
 	defer inst1.Stop()
@@ -176,7 +168,6 @@ func TestPullEngine_Add(t *testing.T) {
 }
 
 func TestPullEngine_Remove(t *testing.T) {
-	t.Parallel()
 	peers := make(map[string]*pullTestInstance)
 	inst1 := newPushPullTestInstance("p1", peers)
 	defer inst1.Stop()
@@ -189,7 +180,6 @@ func TestPullEngine_Remove(t *testing.T) {
 }
 
 func TestPullEngine_Stop(t *testing.T) {
-	t.Parallel()
 	peers := make(map[string]*pullTestInstance)
 	inst1 := newPushPullTestInstance("p1", peers)
 	inst2 := newPushPullTestInstance("p2", peers)
@@ -211,7 +201,6 @@ func TestPullEngine_Stop(t *testing.T) {
 }
 
 func TestPullEngineAll2AllWithIncrementalSpawning(t *testing.T) {
-	t.Parallel()
 	// Scenario: spawn 10 nodes, each 50 ms after the other
 	// and have them transfer data between themselves.
 	// Expected outcome: obviously, everything should succeed.
@@ -237,7 +226,6 @@ func TestPullEngineAll2AllWithIncrementalSpawning(t *testing.T) {
 }
 
 func TestPullEngineSelectiveUpdates(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1 has {1, 3} and inst2 has {0,1,2,3}.
 	// inst1 initiates to inst2
 	// Expected outcome: inst1 asks for 0,2 and inst2 sends 0,2 only
@@ -289,7 +277,6 @@ func TestPullEngineSelectiveUpdates(t *testing.T) {
 }
 
 func TestByzantineResponder(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1 sends hello to inst2 but inst3 is byzantine so it attempts to send a digest and a response to inst1.
 	// expected outcome is for inst1 not to process updates from inst3.
 	peers := make(map[string]*pullTestInstance)
@@ -347,7 +334,6 @@ func TestByzantineResponder(t *testing.T) {
 }
 
 func TestMultipleInitiators(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1, inst2 and inst3 both start protocol with inst4 at the same time.
 	// Expected outcome: inst4 successfully transfers state to all of them
 	peers := make(map[string]*pullTestInstance)
@@ -377,7 +363,6 @@ func TestMultipleInitiators(t *testing.T) {
 }
 
 func TestLatePeers(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1 initiates to inst2 (items: {1,2,3,4}) and inst3 (items: {5,6,7,8}),
 	// but inst2 is too slow to respond, and all items
 	// should be received from inst3.
@@ -410,7 +395,6 @@ func TestLatePeers(t *testing.T) {
 }
 
 func TestBiDiUpdates(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1 has {1, 3} and inst2 has {0,2} and both initiate to the other at the same time.
 	// Expected outcome: both have {0,1,2,3} in the end
 	peers := make(map[string]*pullTestInstance)
@@ -440,7 +424,6 @@ func TestBiDiUpdates(t *testing.T) {
 }
 
 func TestSpread(t *testing.T) {
-	t.Parallel()
 	// Scenario: inst1 initiates to inst2, inst3 inst4 and each have items 0-100. inst5 also has the same items but isn't selected
 	// Expected outcome: each responder (inst2, inst3 and inst4) is chosen at least once (the probability for not choosing each of them is slim)
 	// inst5 isn't selected at all
@@ -499,6 +482,50 @@ func TestSpread(t *testing.T) {
 		}
 	}
 	lock.Unlock()
+}
+
+func TestFilter(t *testing.T) {
+	// Scenario: 3 instances, items [0-5] are found only in the first instance, the other 2 have none.
+	//           and also the first instance only gives the 2nd instance even items, and odd items to the 3rd.
+	//           also, instances 2 and 3 don't know each other.
+	// Expected outcome: inst2 has only even items, and inst3 has only odd items
+	peers := make(map[string]*pullTestInstance)
+	inst1 := newPushPullTestInstance("p1", peers)
+	inst2 := newPushPullTestInstance("p2", peers)
+	inst3 := newPushPullTestInstance("p3", peers)
+	defer inst1.stop()
+	defer inst2.stop()
+	defer inst3.stop()
+
+	inst1.PullEngine.digFilter = func(context interface{}) func(digestItem string) bool {
+		return func(digestItem string) bool {
+			n, _ := strconv.ParseInt(digestItem, 10, 64)
+			if context == "p2" {
+				return n%2 == 0
+			}
+			return n%2 == 1
+		}
+	}
+
+	inst1.Add("0", "1", "2", "3", "4", "5")
+	inst2.setNextPeerSelection([]string{"p1"})
+	inst3.setNextPeerSelection([]string{"p1"})
+
+	time.Sleep(time.Second * 2)
+
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "0", Strcmp) != -1)
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "1", Strcmp) == -1)
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "2", Strcmp) != -1)
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "3", Strcmp) == -1)
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "4", Strcmp) != -1)
+	assert.True(t, util.IndexInSlice(inst2.state.ToArray(), "5", Strcmp) == -1)
+
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "0", Strcmp) == -1)
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "1", Strcmp) != -1)
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "2", Strcmp) == -1)
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "3", Strcmp) != -1)
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "4", Strcmp) == -1)
+	assert.True(t, util.IndexInSlice(inst3.state.ToArray(), "5", Strcmp) != -1)
 
 }
 

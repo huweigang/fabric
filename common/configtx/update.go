@@ -1,134 +1,198 @@
 /*
-Copyright IBM Corp. 2016-2017 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-                 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package configtx
 
 import (
-	"fmt"
+	"strings"
 
+	cb "github.com/hyperledger/fabric-protos-go/common"
 	"github.com/hyperledger/fabric/common/policies"
-	cb "github.com/hyperledger/fabric/protos/common"
-	"github.com/hyperledger/fabric/protos/utils"
+	"github.com/hyperledger/fabric/protoutil"
+	"github.com/pkg/errors"
 )
 
-// authorizeUpdate validates that all modified config has the corresponding modification policies satisfied by the signature set
-// it returns a map of the modified config
-func (cm *configManager) authorizeUpdate(configUpdateEnv *cb.ConfigUpdateEnvelope) (map[string]comparable, error) {
-	if configUpdateEnv == nil {
-		return nil, fmt.Errorf("Cannot process nil ConfigUpdateEnvelope")
-	}
+func (vi *ValidatorImpl) verifyReadSet(readSet map[string]comparable) error {
+	for key, value := range readSet {
+		existing, ok := vi.configMap[key]
+		if !ok {
+			return errors.Errorf("existing config does not contain element for %s but was in the read set", key)
+		}
 
-	config, err := UnmarshalConfigUpdate(configUpdateEnv.ConfigUpdate)
-	if err != nil {
-		return nil, err
+		if existing.version() != value.version() {
+			return errors.Errorf("proposed update requires that key %s be at version %d, but it is currently at version %d", key, value.version(), existing.version())
+		}
 	}
+	return nil
+}
 
-	if config.ChannelId != cm.chainID {
-		return nil, fmt.Errorf("Update not for correct channel: %s for %s", config.ChannelId, cm.chainID)
-	}
+func computeDeltaSet(readSet, writeSet map[string]comparable) map[string]comparable {
+	result := make(map[string]comparable)
+	for key, value := range writeSet {
+		readVal, ok := readSet[key]
 
-	seq := computeSequence(config.WriteSet)
-	if err != nil {
-		return nil, err
-	}
-
-	signedData, err := configUpdateEnv.AsSignedData()
-	if err != nil {
-		return nil, err
-	}
-
-	// Verify config is a sequential update to prevent exhausting sequence numbers
-	if seq != cm.sequence+1 {
-		return nil, fmt.Errorf("Config sequence number jumped from %d to %d", cm.sequence, seq)
-	}
-
-	configMap, err := mapConfig(config.WriteSet)
-	if err != nil {
-		return nil, err
-	}
-	for key, value := range configMap {
-		logger.Debugf("Processing key %s with value %v", key, value)
-		if key == "[Groups] /Channel" {
-			// XXX temporary hack to prevent group evaluation for modification
+		if ok && readVal.version() == value.version() {
 			continue
 		}
 
-		// Ensure the config sequence numbers are correct to prevent replay attacks
-		var isModified bool
-
-		oldValue, ok := cm.config[key]
-		if ok {
-			isModified = !value.equals(oldValue)
-		} else {
-			if value.version() != seq {
-				return nil, fmt.Errorf("Key %v was new, but had an older Sequence %d set", key, value.version())
-			}
-			isModified = true
-		}
-
-		// If a config item was modified, its Version must be set correctly, and it must satisfy the modification policy
-		if isModified {
-			logger.Debugf("Proposed config item %s on channel %s has been modified", key, cm.chainID)
-
-			if value.version() != seq {
-				return nil, fmt.Errorf("Key %s was modified, but its Version %d does not equal current configtx Sequence %d", key, value.version(), seq)
-			}
-
-			// Get the modification policy for this config item if one was previously specified
-			// or accept it if it is new, as the group policy will be evaluated for its inclusion
-			if ok {
-				policy, ok := cm.policyForItem(oldValue)
-				if !ok {
-					return nil, fmt.Errorf("Unexpected missing policy %s for item %s", oldValue.modPolicy(), key)
-				}
-
-				// Ensure the policy is satisfied
-				if err = policy.Evaluate(signedData); err != nil {
-					return nil, fmt.Errorf("Policy for %s not satisfied: %s", key, err)
-				}
-			}
-
-		}
+		// If the key in the readset is a different version, we include it
+		// Error checking on the sanity of the update is done against the config
+		result[key] = value
 	}
-
-	// Ensure that any config items which used to exist still exist, to prevent implicit deletion
-	for key, _ := range cm.config {
-		_, ok := configMap[key]
-		if !ok {
-			return nil, fmt.Errorf("Missing key %v in new config", key)
-		}
-
-	}
-
-	return cm.computeUpdateResult(configMap), nil
+	return result
 }
 
-func (cm *configManager) policyForItem(item comparable) (policies.Policy, bool) {
-	// path is always at least of length 1
-	manager, ok := cm.PolicyManager().Manager(item.path[1:])
-	if !ok {
-		return nil, ok
+func validateModPolicy(modPolicy string) error {
+	if modPolicy == "" {
+		return errors.Errorf("mod_policy not set")
 	}
+
+	trimmed := modPolicy
+	if modPolicy[0] == '/' {
+		trimmed = modPolicy[1:]
+	}
+
+	for i, pathElement := range strings.Split(trimmed, pathSeparator) {
+		err := validateConfigID(pathElement)
+		if err != nil {
+			return errors.Wrapf(err, "path element at %d is invalid", i)
+		}
+	}
+	return nil
+
+}
+
+func (vi *ValidatorImpl) verifyDeltaSet(deltaSet map[string]comparable, signedData []*protoutil.SignedData) error {
+	if len(deltaSet) == 0 {
+		return errors.Errorf("delta set was empty -- update would have no effect")
+	}
+
+	for key, value := range deltaSet {
+		logger.Debugf("Processing change to key: %s", key)
+		if err := validateModPolicy(value.modPolicy()); err != nil {
+			return errors.Wrapf(err, "invalid mod_policy for element %s", key)
+		}
+
+		existing, ok := vi.configMap[key]
+		if !ok {
+			if value.version() != 0 {
+				return errors.Errorf("attempted to set key %s to version %d, but key does not exist", key, value.version())
+			}
+
+			continue
+		}
+		if value.version() != existing.version()+1 {
+			return errors.Errorf("attempt to set key %s to version %d, but key is at version %d", key, value.version(), existing.version())
+		}
+
+		policy, ok := vi.policyForItem(existing)
+		if !ok {
+			return errors.Errorf("unexpected missing policy %s for item %s", existing.modPolicy(), key)
+		}
+
+		// Ensure the policy is satisfied
+		if err := policy.EvaluateSignedData(signedData); err != nil {
+			return errors.Wrapf(err, "policy for %s not satisfied", key)
+		}
+	}
+	return nil
+}
+
+func verifyFullProposedConfig(writeSet, fullProposedConfig map[string]comparable) error {
+	for key := range writeSet {
+		if _, ok := fullProposedConfig[key]; !ok {
+			return errors.Errorf("writeset contained key %s which did not appear in proposed config", key)
+		}
+	}
+	return nil
+}
+
+// authorizeUpdate validates that all modified config has the corresponding modification policies satisfied by the signature set
+// it returns a map of the modified config
+func (vi *ValidatorImpl) authorizeUpdate(configUpdateEnv *cb.ConfigUpdateEnvelope) (map[string]comparable, error) {
+	if configUpdateEnv == nil {
+		return nil, errors.Errorf("cannot process nil ConfigUpdateEnvelope")
+	}
+
+	configUpdate, err := UnmarshalConfigUpdate(configUpdateEnv.ConfigUpdate)
+	if err != nil {
+		return nil, err
+	}
+
+	if configUpdate.ChannelId != vi.channelID {
+		return nil, errors.Errorf("ConfigUpdate for channel '%s' but envelope for channel '%s'", configUpdate.ChannelId, vi.channelID)
+	}
+
+	readSet, err := mapConfig(configUpdate.ReadSet, vi.namespace)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error mapping ReadSet")
+	}
+	err = vi.verifyReadSet(readSet)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error validating ReadSet")
+	}
+
+	writeSet, err := mapConfig(configUpdate.WriteSet, vi.namespace)
+	if err != nil {
+		return nil, errors.Wrapf(err, "error mapping WriteSet")
+	}
+
+	deltaSet := computeDeltaSet(readSet, writeSet)
+	signedData, err := protoutil.ConfigUpdateEnvelopeAsSignedData(configUpdateEnv)
+	if err != nil {
+		return nil, err
+	}
+
+	if err = vi.verifyDeltaSet(deltaSet, signedData); err != nil {
+		return nil, errors.Wrapf(err, "error validating DeltaSet")
+	}
+
+	fullProposedConfig := vi.computeUpdateResult(deltaSet)
+	if err := verifyFullProposedConfig(writeSet, fullProposedConfig); err != nil {
+		return nil, errors.Wrapf(err, "full config did not verify")
+	}
+
+	return fullProposedConfig, nil
+}
+
+func (vi *ValidatorImpl) policyForItem(item comparable) (policies.Policy, bool) {
+	manager := vi.pm
+
+	modPolicy := item.modPolicy()
+	logger.Debugf("Getting policy for item %s with mod_policy %s", item.key, modPolicy)
+
+	// If the mod_policy path is relative, get the right manager for the context
+	// If the item has a zero length path, it is the root group, use the base policy manager
+	// if the mod_policy path is absolute (starts with /) also use the base policy manager
+	if len(modPolicy) > 0 && modPolicy[0] != policies.PathSeparator[0] && len(item.path) != 0 {
+		var ok bool
+
+		manager, ok = manager.Manager(item.path[1:])
+		if !ok {
+			logger.Debugf("Could not find manager at path: %v", item.path[1:])
+			return nil, ok
+		}
+
+		// In the case of the group type, its key is part of its path for the purposes of finding the policy manager
+		if item.ConfigGroup != nil {
+			manager, ok = manager.Manager([]string{item.key})
+		}
+		if !ok {
+			logger.Debugf("Could not find group at subpath: %v", item.key)
+			return nil, ok
+		}
+	}
+
 	return manager.GetPolicy(item.modPolicy())
 }
 
 // computeUpdateResult takes a configMap generated by an update and produces a new configMap overlaying it onto the old config
-func (cm *configManager) computeUpdateResult(updatedConfig map[string]comparable) map[string]comparable {
+func (vi *ValidatorImpl) computeUpdateResult(updatedConfig map[string]comparable) map[string]comparable {
 	newConfigMap := make(map[string]comparable)
-	for key, value := range cm.config {
+	for key, value := range vi.configMap {
 		newConfigMap[key] = value
 	}
 
@@ -136,31 +200,4 @@ func (cm *configManager) computeUpdateResult(updatedConfig map[string]comparable
 		newConfigMap[key] = value
 	}
 	return newConfigMap
-}
-
-func envelopeToConfigUpdate(configtx *cb.Envelope) (*cb.ConfigUpdateEnvelope, error) {
-	payload, err := utils.UnmarshalPayload(configtx.Payload)
-	if err != nil {
-		return nil, err
-	}
-
-	if payload.Header == nil {
-		return nil, fmt.Errorf("Envelope must have a Header")
-	}
-
-	chdr, err := utils.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-	if err != nil {
-		return nil, fmt.Errorf("Invalid ChannelHeader")
-	}
-
-	if chdr.Type != int32(cb.HeaderType_CONFIG_UPDATE) {
-		return nil, fmt.Errorf("Not a tx of type CONFIG_UPDATE")
-	}
-
-	configUpdateEnv, err := UnmarshalConfigUpdateEnvelope(payload.Data)
-	if err != nil {
-		return nil, fmt.Errorf("Error unmarshaling ConfigUpdateEnvelope: %s", err)
-	}
-
-	return configUpdateEnv, nil
 }

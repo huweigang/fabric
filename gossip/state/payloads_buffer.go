@@ -1,30 +1,18 @@
 /*
-Copyright IBM Corp. 2016 All Rights Reserved.
+Copyright IBM Corp. All Rights Reserved.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-		 http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
+SPDX-License-Identifier: Apache-2.0
 */
 
 package state
 
 import (
-	"fmt"
-	"strconv"
 	"sync"
 	"sync/atomic"
 
+	proto "github.com/hyperledger/fabric-protos-go/gossip"
+	"github.com/hyperledger/fabric/common/metrics"
 	"github.com/hyperledger/fabric/gossip/util"
-	proto "github.com/hyperledger/fabric/protos/gossip"
-	"github.com/op/go-logging"
 )
 
 // PayloadsBuffer is used to store payloads into which used to
@@ -33,7 +21,7 @@ import (
 // to signal whenever expected block has arrived.
 type PayloadsBuffer interface {
 	// Adds new block into the buffer
-	Push(payload *proto.Payload) error
+	Push(payload *proto.Payload)
 
 	// Returns next expected sequence number
 	Next() uint64
@@ -54,24 +42,24 @@ type PayloadsBuffer interface {
 // PayloadsBufferImpl structure to implement PayloadsBuffer interface
 // store inner state of available payloads and sequence numbers
 type PayloadsBufferImpl struct {
-	buf map[uint64]*proto.Payload
-
 	next uint64
+
+	buf map[uint64]*proto.Payload
 
 	readyChan chan struct{}
 
 	mutex sync.RWMutex
 
-	logger *logging.Logger
+	logger util.Logger
 }
 
 // NewPayloadsBuffer is factory function to create new payloads buffer
 func NewPayloadsBuffer(next uint64) PayloadsBuffer {
 	return &PayloadsBufferImpl{
 		buf:       make(map[uint64]*proto.Payload),
-		readyChan: make(chan struct{}, 0),
+		readyChan: make(chan struct{}, 1),
 		next:      next,
-		logger:    util.GetLogger(util.LoggingStateModule, ""),
+		logger:    util.GetLogger(util.StateLogger, ""),
 	}
 }
 
@@ -84,28 +72,25 @@ func (b *PayloadsBufferImpl) Ready() chan struct{} {
 
 // Push new payload into the buffer structure in case new arrived payload
 // sequence number is below the expected next block number payload will be
-// thrown away and error will be returned.
-func (b *PayloadsBufferImpl) Push(payload *proto.Payload) error {
+// thrown away.
+// TODO return bool to indicate if payload was added or not, so that caller can log result.
+func (b *PayloadsBufferImpl) Push(payload *proto.Payload) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
 
 	seqNum := payload.SeqNum
 
 	if seqNum < b.next || b.buf[seqNum] != nil {
-		return fmt.Errorf("Payload with sequence number = %s has been already processed",
-			strconv.FormatUint(payload.SeqNum, 10))
+		b.logger.Debugf("Payload with sequence number = %d has been already processed", payload.SeqNum)
+		return
 	}
 
 	b.buf[seqNum] = payload
 
 	// Send notification that next sequence has arrived
-	if seqNum == b.next {
-		// Do not block execution of current routine
-		go func() {
-			b.readyChan <- struct{}{}
-		}()
+	if seqNum == b.next && len(b.readyChan) == 0 {
+		b.readyChan <- struct{}{}
 	}
-	return nil
 }
 
 // Next function provides the number of the next expected block
@@ -127,18 +112,58 @@ func (b *PayloadsBufferImpl) Pop() *proto.Payload {
 		delete(b.buf, b.Next())
 		// Increment next expect block index
 		atomic.AddUint64(&b.next, 1)
+
+		b.drainReadChannel()
+
 	}
+
 	return result
+}
+
+// drainReadChannel empties ready channel in case last
+// payload has been poped up and there are still awaiting
+// notifications in the channel
+func (b *PayloadsBufferImpl) drainReadChannel() {
+	if len(b.buf) == 0 {
+		for {
+			if len(b.readyChan) > 0 {
+				<-b.readyChan
+			} else {
+				break
+			}
+		}
+	}
 }
 
 // Size returns current number of payloads stored within buffer
 func (b *PayloadsBufferImpl) Size() int {
-	b.mutex.Lock()
-	defer b.mutex.Unlock()
+	b.mutex.RLock()
+	defer b.mutex.RUnlock()
 	return len(b.buf)
 }
 
 // Close cleanups resources and channels in maintained
 func (b *PayloadsBufferImpl) Close() {
 	close(b.readyChan)
+}
+
+type metricsBuffer struct {
+	PayloadsBuffer
+	sizeMetrics metrics.Gauge
+	chainID     string
+}
+
+func (mb *metricsBuffer) Push(payload *proto.Payload) {
+	mb.PayloadsBuffer.Push(payload)
+	mb.reportSize()
+}
+
+func (mb *metricsBuffer) Pop() *proto.Payload {
+	pl := mb.PayloadsBuffer.Pop()
+	mb.reportSize()
+	return pl
+}
+
+func (mb *metricsBuffer) reportSize() {
+	mb.sizeMetrics.With("channel", mb.chainID).Set(float64(mb.Size()))
 }

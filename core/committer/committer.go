@@ -16,7 +16,10 @@ limitations under the License.
 
 package committer
 
-import "github.com/hyperledger/fabric/protos/common"
+import (
+	"github.com/hyperledger/fabric-protos-go/common"
+	"github.com/hyperledger/fabric/core/ledger"
+)
 
 // Committer is the interface supported by committers
 // The only committer is noopssinglechain committer.
@@ -27,14 +30,39 @@ import "github.com/hyperledger/fabric/protos/common"
 // change
 type Committer interface {
 
-	// Commit block to the ledger
-	Commit(block *common.Block) error
+	// CommitLegacy block and private data into the ledger
+	CommitLegacy(blockAndPvtData *ledger.BlockAndPvtData, commitOpts *ledger.CommitOptions) error
+
+	// GetPvtDataAndBlockByNum retrieves block with private data with given
+	// sequence number
+	GetPvtDataAndBlockByNum(seqNum uint64) (*ledger.BlockAndPvtData, error)
+
+	// GetPvtDataByNum returns a slice of the private data from the ledger
+	// for given block and based on the filter which indicates a map of
+	// collections and namespaces of private data to retrieve
+	GetPvtDataByNum(blockNum uint64, filter ledger.PvtNsCollFilter) ([]*ledger.TxPvtData, error)
 
 	// Get recent block sequence number
 	LedgerHeight() (uint64, error)
 
+	// DoesPvtDataInfoExistInLedger returns true if the ledger has pvtdata info
+	// about a given block number.
+	DoesPvtDataInfoExistInLedger(blockNum uint64) (bool, error)
+
 	// Gets blocks with sequence numbers provided in the slice
 	GetBlocks(blockSeqs []uint64) []*common.Block
+
+	// GetConfigHistoryRetriever returns the ConfigHistoryRetriever
+	GetConfigHistoryRetriever() (ledger.ConfigHistoryRetriever, error)
+
+	// CommitPvtDataOfOldBlocks commits the private data corresponding to already committed block
+	// If hashes for some of the private data supplied in this function does not match
+	// the corresponding hash present in the block, the unmatched private data is not
+	// committed and instead the mismatch inforation is returned back
+	CommitPvtDataOfOldBlocks(reconciledPvtdata []*ledger.ReconciledPvtdata) ([]*ledger.PvtdataHashMismatch, error)
+
+	// GetMissingPvtDataTracker return the MissingPvtDataTracker
+	GetMissingPvtDataTracker() (ledger.MissingPvtDataTracker, error)
 
 	// Closes committing service
 	Close()
